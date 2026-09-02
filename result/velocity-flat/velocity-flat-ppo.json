@@ -1,0 +1,13 @@
+{
+  "action_abs_mean": 0.1877708018757403,
+  "checkpoint": "/mnt/nas_datasets/models/trained/rl_duck/velocity-flat-ppo/model_6000.pt",
+  "checkpoint_iteration": 6000,
+  "done_count": 0,
+  "done_fraction": 0.0,
+  "mean_reward": 0.1667116456106305,
+  "num_envs": 16,
+  "run_name": "velocity-flat-ppo",
+  "steps": 400,
+  "video_frames": 400,
+  "video_output": "/mnt/nas_code/Xpersonal/Xbotics2/rl_duck/result/velocity-flat/velocity-flat-ppo.mp4"
+}
