@@ -27,6 +27,10 @@ dependencies = [
     "mediapy",
 ]
 
+[dependency-groups]
+# `uv sync` 默认会装 dev 组，所以冒烟测试开箱就能跑（不用 `uv run --with pytest`）。
+dev = ["pytest"]
+
 [tool.uv]
 package = false
 # 这三条抄自上游 microduck_rl 的 pyproject —— uv 只认「工作区根」的 override 与 source，
@@ -39,11 +43,23 @@ override-dependencies = [
     # bam 依赖 PyPI 上的占位包 zmq==0.0.0，它的 wheel 是坏的（缺 .dist-info），
     # 干净环境上 uv sync 会直接失败。我们只用 bam.mjlab，用一个永假的 marker 把它丢掉。
     "zmq ; python_version < '3.0'",
+    # BAM 执行器模型钉到上游 uv.lock 里那个实测可用的 commit。
+    #
+    # 为什么走 override 而不是 [tool.uv.sources]，两条路都试过：
+    #   · 只写 sources → **静默无效**。BAM 是 mjlab-microduck 的传递依赖，
+    #     而 uv 的 sources 只作用于 [project.dependencies] 里的直接依赖。
+    #   · 再把它列成直接依赖 → uv 报**冲突**：mjlab-microduck 要 @mjlab_frictionloss（分支），
+    #     我们要 @62bd8ce（提交），uv 把「分支」和「提交」当成两个不同的来源。
+    # override 是唯一能替所有需求方一次定死的地方。
+    #
+    # 为什么非钉不可：分支最新的 57d13ea 那一版，cfg 基类没有 vin_drop_gain_range，
+    # 而 microduck@5946fd9 会往里传 —— 表现是 uv sync 成功、320 个包装齐，
+    # 一 import 就 TypeError。装得下来、跑不起来，是这类问题最费时间的形态。
+    "better-actuator-models @ git+https://github.com/Rhoban/bam.git@62bd8ce12154340be97e06f7f41a0ca8f116d967",
 ]
 
 [tool.uv.sources]
 # 钉具体 commit，不用 branch —— 上游在动，branch 会让「同一份代码」在不同时间装出不同东西。
 mjlab-microduck = { git = "https://github.com/pollen-robotics/microduck_rl", rev = "5946fd9cdbc58956424420153e51975af3b30d77" }
-# BAM 执行器模型的分发名是 better-actuator-models，import 名是 bam。
-# PyPI 上没有能用的版本，必须从这个分支装。
-better-actuator-models = { git = "https://github.com/Rhoban/bam.git", branch = "mjlab_frictionloss" }
+# BAM 执行器模型（分发名 better-actuator-models，import 名 bam）不在这里 ——
+# 它是传递依赖，sources 对它无效，只能走上面的 override-dependencies。
