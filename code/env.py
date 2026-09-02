@@ -92,6 +92,8 @@ class DuckEnv:
         render_mode=None,
         task=TASK,
         max_extra_envs=0,
+        render_size=None,
+        camera_distance=None,
     ):
         if task not in list_tasks():
             raise ValueError(f"未注册的任务 {task!r}；可选值见 `python code/env.py`")
@@ -100,6 +102,14 @@ class DuckEnv:
         cfg.seed = seed
         # 训练与评测只渲第 0 个环境（省时间）；出「一屏一群鸭子」那张图时把它调大。
         cfg.viewer.max_extra_envs = max_extra_envs
+        # mjlab 的默认渲染分辨率是 320×240 —— 够看不够印。要进讲义的图必须显式放大，
+        # 否则渲出来的东西照样能存成 PNG、脚本照样退 0，只是印在纸上是一团马赛克。
+        if render_size is not None:
+            cfg.viewer.width, cfg.viewer.height = render_size
+        # 相机默认距离 5 米、俯角 45 度，对一只 25 厘米高的鸭子来说单只太小、一群又装不下。
+        # 单只关键帧要拉近，一群的全景要拉远。
+        if camera_distance is not None:
+            cfg.viewer.distance = camera_distance
 
         self.task = task
         resolved_device = device if torch.cuda.is_available() or device == "cpu" else "cpu"

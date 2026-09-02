@@ -39,6 +39,15 @@ from rollout import load_policy  # noqa: E402
 # 权重文件。留空（None）就用随机初始化的策略 —— 只为验证版面，别拿它当结果图。
 CHECKPOINT: str | None = None
 
+# 渲染分辨率。mjlab 的默认是 320×240，够在窗口里看、不够印进讲义 ——
+# 必须显式放大，否则图照样存得下来、脚本照样退 0，只是印在纸上是一团马赛克。
+PARALLEL_SIZE = (1600, 900)
+KEYFRAME_SIZE = (960, 720)
+
+# 相机距离。默认 5 米对一只 25 厘米高的鸭子来说：单只太小、一群又装不下。
+PARALLEL_DISTANCE = 3.0
+KEYFRAME_DISTANCE = 0.9
+
 # 并行仿真图：开多少个环境、让 viewer 额外画进来多少个。
 # 32 个左右在一屏里既看得清单只鸭子、又有"一群"的观感；开太多会糊成一片。
 PARALLEL_ENVS = 32
@@ -129,6 +138,8 @@ def render_parallel(checkpoint: str | None = CHECKPOINT) -> Path:
         seed=0,
         render_mode="rgb_array",
         max_extra_envs=PARALLEL_ENVS - 1,
+        render_size=PARALLEL_SIZE,
+        camera_distance=PARALLEL_DISTANCE,
     )
     try:
         model, tag = make_policy(env, checkpoint)
@@ -164,7 +175,14 @@ def render_keyframes(checkpoint: str | None = CHECKPOINT) -> Path:
     Returns:
         写出的 PNG 路径。
     """
-    env = DuckEnv(num_envs=1, device="cuda:0", seed=1, render_mode="rgb_array")
+    env = DuckEnv(
+        num_envs=1,
+        device="cuda:0",
+        seed=1,
+        render_mode="rgb_array",
+        render_size=KEYFRAME_SIZE,
+        camera_distance=KEYFRAME_DISTANCE,
+    )
     frames: list[np.ndarray] = []
     try:
         model, tag = make_policy(env, checkpoint)
