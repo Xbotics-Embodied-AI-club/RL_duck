@@ -3,8 +3,11 @@
 三类图共用一条渲染路径（`DuckEnv(render_mode="rgb_array")` 逐帧取画面），区别只在
 开几个环境、用哪份权重、怎么拼版：
 
-- **并行仿真图**：一屏一群小鸭子各自训练那种，撑视觉冲击。开多个环境并让 viewer
-  把它们都画进来（`max_extra_envs`）。
+- **并行仿真图 / 视频**：一屏一群小鸭子各自训练那种，撑视觉冲击。出一张 PNG 加一段 MP4。
+  ⚠️ **这张图是叠画出来的，不是一个场地里的实况。** 训练的并行是「多个环境、每只鸭子
+  一个环境」—— 每个环境是一份独立的物理世界，鸭子之间既看不见也碰不到。渲染器先画
+  第 0 个环境，再把邻近几个环境的鸭子的几何体**追加**进同一张画面（`max_extra_envs`），
+  所以图注必须说清这一点，否则读者会以为它们在互相避让。
 - **关键帧序列**：一个动作横排 4–6 帧，读者一眼看出它做了什么。
 - **开篇拼图**：把已经渲好的各动作关键帧摆成一个网格，先给结果再讲道理。
 
@@ -23,6 +26,7 @@ import sys
 from pathlib import Path
 
 import matplotlib
+import mediapy as media
 import numpy as np
 import torch
 
@@ -141,25 +145,29 @@ def render_parallel(checkpoint: str | None = CHECKPOINT) -> Path:
         render_size=PARALLEL_SIZE,
         camera_distance=PARALLEL_DISTANCE,
     )
+    frames: list[np.ndarray] = []
     try:
         model, tag = make_policy(env, checkpoint)
         obs, _critic = env.reset()
-        frame = None
         for _ in range(PARALLEL_WARMUP_STEPS):
             with torch.no_grad():
                 actions = model.act_inference(obs)
             obs, _critic, _r, _d, _i = env.step(actions)
             rendered = env.render()
             if rendered is not None:
-                frame = _as_uint8(rendered)
+                frames.append(_as_uint8(rendered))
+        fps = float(env.metadata.get("render_fps", 50.0))
     finally:
         env.close()
 
-    if frame is None:
+    if not frames:
         raise RuntimeError("render() 一帧都没回 —— 检查 render_mode 与 viewer 配置")
     out = result_dir() / f"parallel-{tag}.png"
-    plt.imsave(out, frame)
-    print(f"写出 {out}  ({frame.shape[1]}×{frame.shape[0]}，{PARALLEL_ENVS} 个环境)")
+    plt.imsave(out, frames[-1])
+    video = result_dir() / f"parallel-{tag}.mp4"
+    media.write_video(str(video), frames, fps=fps)
+    h, w = frames[-1].shape[:2]
+    print(f"写出 {out} 与 {video}  ({w}×{h}，{PARALLEL_ENVS} 个环境，{len(frames)} 帧)")
     return out
 
 
