@@ -18,8 +18,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import MAX_ITERATIONS, DuckEnv, task_slug  # noqa: E402
-from model import ActorCritic  # noqa: E402
+from env import MAX_ITERATIONS, DuckEnv, task_slug
+from model import ActorCritic
 
 
 def result_root() -> Path:
@@ -98,10 +98,11 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         seed=seed,
         render_mode="rgb_array",
         shadows=False,
-        render_size=(960, 720),
-        camera_distance=0.8,
+        render_size=(1280, 960),
+        camera_distance=0.9,
         camera_elevation=-15.0,
-        camera_lookat=(0.0, 0.0, 0.18),
+        # 跟拍：策略在按速度指令行走，固定机位下它几秒就出画，长镜头会变成一段空地板。
+        camera_origin="asset_root",
     )
     rewards, action_abs_means, frames = [], [], []
     done_count = 0
@@ -126,7 +127,7 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         "checkpoint": str(Path(checkpoint)),
         "checkpoint_iteration": iteration,
         "video_output": str(video_output),
-        "video_frames": int(len(frames)),
+        "video_frames": len(frames),
         "num_envs": int(num_envs),
         "steps": int(num_steps),
         "mean_reward": float(sum(rewards) / len(rewards)) if rewards else 0.0,

@@ -20,11 +20,11 @@ import matplotlib
 import numpy as np
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-from matplotlib import font_manager  # noqa: E402
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import NUM_ENVS, task_slug  # noqa: E402
+from env import NUM_ENVS, task_slug
 
 # 三个版本在图上的固定顺序与颜色。顺序就是讲义里的演进顺序，别按字母排。
 ALGOS = (

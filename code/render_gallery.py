@@ -31,20 +31,22 @@ import numpy as np
 import torch
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import TASK, DuckEnv, task_slug  # noqa: E402
-from model import ActorCritic  # noqa: E402
-from plot_reward_curves import use_project_font  # noqa: E402
-from rollout import load_policy  # noqa: E402
+from env import TASK, DuckEnv, task_slug
+from model import ActorCritic
+from plot_reward_curves import use_project_font
+from rollout import load_policy
 
 # ======================== 这一轮渲什么 ========================
-# 权重文件。留 None 就自动取当前 TASK 的 PPO 那一档**最新**的 checkpoint；
+# 权重文件。留空就自动取当前 TASK 的 PPO 那一档**最新**的 checkpoint；
 # 一个都没有（还没开训）就退回随机初始化的策略，只为验证版面 ——
 # 那种图文件名带 untrained 后缀，别拿它当结果图。
-# 想钉某一个具体的 checkpoint，把路径写在这里。
-CHECKPOINT: str | None = None
+#
+# 批量出图时用 RL_DUCK_CHECKPOINT 按进程指定：**最终 checkpoint 不等于最好的**
+# （实测摔倒起身那档末段比峰值段低 0.045），出视频要挑峰值段那个权重。
+CHECKPOINT: str | None = os.environ.get("RL_DUCK_CHECKPOINT") or None
 
 # 渲染分辨率。mjlab 的默认是 320×240，够在窗口里看、不够印进讲义 ——
 # 必须显式放大，否则图照样存得下来、脚本照样退 0，只是印在纸上是一团马赛克。
@@ -61,7 +63,7 @@ KEYFRAME_SIZE = (960, 720)
 #        正确的杠杆是**改间距**，不是退相机：每个环境是独立的物理世界，
 #        间距只影响画面偏移与地形分片查询，平地上纯属视觉安排。
 PARALLEL_SPACING = 0.8
-PARALLEL_ELEVATION = -15.0
+PARALLEL_ELEVATION = -22.0
 KEYFRAME_DISTANCE = 0.8
 KEYFRAME_ELEVATION = -15.0
 KEYFRAME_LOOKAT = (0.0, 0.0, 0.18)
@@ -69,9 +71,16 @@ KEYFRAME_LOOKAT = (0.0, 0.0, 0.18)
 # 并行仿真图开多少个环境（全都画进画面）。
 # 六只：既表达了"不止一只、各自在学"，每只又还看得清在做什么。
 PARALLEL_ENVS = 6
-# 先跑一会儿让姿态散开，别都停在初始站姿；但也别跑太久 ——
-# 它们会各自走开，队形散了就框不住了。
-PARALLEL_WARMUP_STEPS = 45
+# 预热与录制**必须分开两个数**。之前它们是同一个：为了让队形别散，我把这个数
+# 从 150 砍到 45，顺手把视频从 3 秒砍成了 0.9 秒 —— 一个常量管着两件事。
+# 预热只是等步态起来（一个步态周期约 20 步），录制才决定视频多长。
+# ⚠️ 上限来自任务本身，实测过：六只各拿一个**不同的**随机速度指令，所以它们必然走散。
+# 200 帧（4 秒）跑完只剩 3 只还在画面里 —— 我先前以为 4 秒还框得住，量了才知道不行。
+# 预热 12 步（约半个步态周期）让它们不是僵在初始站姿；录 1000 帧（20 秒）。
+# 长镜头是安全的，两条实测支撑：160 步里最远两只从 2.50 米收到 2.03 米（往中间聚、
+# 不是散开），群体中心只漂 13 厘米；而且相机是跟拍的（track_robot），不是固定机位。
+PARALLEL_PREROLL = 12
+PARALLEL_RECORD = 1000
 
 # 关键帧序列：横排几帧、总共跑多少步、从第几步开始取。
 KEYFRAME_COUNT = 5
@@ -110,34 +119,76 @@ def latest_checkpoint() -> str | None:
     return str(found[-1]) if found else None
 
 
-def parallel_camera(num_envs: int) -> tuple[float, tuple[float, float, float]]:
-    """按这批环境实际铺开的范围，算出相机该放多远、看向哪。
+def parallel_camera(num_envs: int, checkpoint: str | None) -> tuple[float, float, tuple[float, float, float]]:
+    """先跑一遍量出这几只鸭子的**实际**位置，再据此算相机。
 
-    先空建一次环境（不带渲染器，便宜）把真实的环境原点读出来，再取中心与跨度 ——
-    而不是按环境间距猜数。猜的数在 `PARALLEL_ENVS` 一改就悄悄偏掉：镜头照样出图、
-    脚本照样退 0，只是鸭子跑到画面角上或者小成一排点。
+    为什么不用出生点（`env_origins`）算：实测过，两者差 45%。出生点是 3×2 的格子、
+    x 方向跨 1.6 米，而机器人加上各自的初始姿态偏移之后，实际 x 跨度是 2.50 米。
+    按出生点算余量必然框不住。
+
+    长镜头是安全的：实测 160 步里最远两只的距离从 2.50 米收到 2.03 米（六只各追各的
+    速度指令，净效果是往中间聚而不是散开），群体中心只漂 13 厘米。
 
     Args:
         num_envs: 这张图要开多少个环境。
+        checkpoint: 权重路径；None 就用随机策略量（位置分布差不多）。
 
     Returns:
-        (相机距离, 视线目标)。视线的 z 抬到鸭子躯干高度，不钉在地面。
+        (相机距离, 方位角, 视线目标)。
     """
     probe = DuckEnv(num_envs=num_envs, device="cuda:0", seed=0, render_mode=None,
                     env_spacing=PARALLEL_SPACING)
     try:
-        origins = probe.unwrapped.scene.env_origins[:num_envs].float()
-        center = origins.mean(dim=0).tolist()
-        span = float((origins.max(dim=0).values - origins.min(dim=0).values)[:2].max())
+        model, _tag = make_policy(probe, checkpoint)
+        obs, _critic = probe.reset()
+        for _ in range(PARALLEL_PREROLL):
+            with torch.no_grad():
+                actions = model.act_inference(obs)
+            obs, _critic, _r, _d, _i = probe.step(actions)
+        pos = _root_xy(probe, num_envs)
     finally:
         probe.close()
-    # 间距已经压小了，这里只需给一点余量：跨度 + 1.3 米。
-    # 竖直视角约 45 度，2.5 米处画面高约 2 米、宽约 3.6 米，这个跨度装得下还有边。
-    distance = span * 0.8 + 1.0
+
+    center = pos.mean(axis=0)
+    centered = pos - center
+    if num_envs > 1:
+        # 主轴 = 这几只实际排开的方向（协方差第一主成分）。
+        axis = np.linalg.svd(centered, full_matrices=False)[2][0]
+        along = centered @ axis
+        across = centered @ np.array([-axis[1], axis[0]])
+        long_extent = float(along.max() - along.min())
+        short_extent = float(across.max() - across.min())
+    else:
+        axis = np.array([1.0, 0.0])
+        long_extent = short_extent = 0.0
+
+    # MuJoCo 的 azimuth 是绕竖直轴的角度（度）；取主轴方向再转 90°，
+    # 相机就从垂直于主轴的方向看过去，那条线在画面里横着铺满。
+    azimuth = float(np.degrees(np.arctan2(axis[1], axis[0])) + 90.0)
+    # 竖直视角约 45 度、16:9，所以水平视野 ≈ 2·d·tan(38°) ≈ 1.56·d。
+    # 要让主轴跨度只占画面宽的 70%（两边留边），d ≈ 跨度 / (1.56 × 0.7)。
+    # 再加上纵深那一档的一半，免得靠后的那几只被上边缘切掉。
+    distance = long_extent / 1.09 + short_extent * 0.5 + 0.6
     lookat = (float(center[0]), float(center[1]), 0.22)
-    print(f"一群那张图：{num_envs} 只，间距 {PARALLEL_SPACING} 米、实际铺开 {span:.2f} 米"
-          f" => 相机 {distance:.2f} 米，看向 {lookat}")
-    return distance, lookat
+    print(f"一群那张图：{num_envs} 只，实测主轴跨 {long_extent:.2f} 米、纵深 {short_extent:.2f} 米"
+          f" => 相机 {distance:.2f} 米 / 方位 {azimuth:.0f}° / 俯 {PARALLEL_ELEVATION}° / 看向 {lookat}")
+    return distance, azimuth, lookat
+
+
+def _root_xy(env: DuckEnv, num: int) -> np.ndarray:
+    """取每个环境里机器人根节点的世界坐标 xy。
+
+    属性名在 mjlab 各版本里叫法不同，按可用的取；一个都没有就把候选列出来报错 ——
+    不猜、不回落，猜错会静默给出一组错坐标，比报错难查得多。
+    """
+    data = env.unwrapped.scene["robot"].data
+    for name in ("root_link_pos_w", "root_com_pos_w"):
+        v = getattr(data, name, None)
+        if v is not None:
+            return v.float().cpu().numpy()[:num, :2]
+    raise AttributeError(
+        f"找不到根节点世界坐标；可用属性：{[a for a in dir(data) if not a.startswith('_')]}"
+    )
 
 
 def result_dir(slug: str | None = None) -> Path:
@@ -200,7 +251,7 @@ def render_parallel(checkpoint: str | None = None) -> Path:
     Returns:
         写出的 PNG 路径。
     """
-    distance, lookat = parallel_camera(PARALLEL_ENVS)
+    distance, azimuth, lookat = parallel_camera(PARALLEL_ENVS, checkpoint)
     env = DuckEnv(
         num_envs=PARALLEL_ENVS,
         device="cuda:0",
@@ -209,16 +260,27 @@ def render_parallel(checkpoint: str | None = None) -> Path:
         max_extra_envs=PARALLEL_ENVS - 1,
         env_spacing=PARALLEL_SPACING,
         shadows=False,
+        # 用世界固定相机对准群体中心，而不是跟拍某一只：跟拍会把被跟的那只放在
+        # 画面正中，而它在群体的一端，于是其余五只全挤到一侧。群体中心 160 步只漂
+        # 13 厘米，固定机位足够稳。
+        camera_origin="world",
         render_size=PARALLEL_SIZE,
         camera_distance=distance,
         camera_elevation=PARALLEL_ELEVATION,
+        camera_azimuth=azimuth,
         camera_lookat=lookat,
     )
     frames: list[np.ndarray] = []
     try:
         model, tag = make_policy(env, checkpoint)
         obs, _critic = env.reset()
-        for _ in range(PARALLEL_WARMUP_STEPS):
+        # 预热：只推进仿真、不取画面，等步态起来。
+        for _ in range(PARALLEL_PREROLL):
+            with torch.no_grad():
+                actions = model.act_inference(obs)
+            obs, _critic, _r, _d, _i = env.step(actions)
+        # 录制：这一段才是视频。
+        for _ in range(PARALLEL_RECORD):
             with torch.no_grad():
                 actions = model.act_inference(obs)
             obs, _critic, _r, _d, _i = env.step(actions)
@@ -232,10 +294,12 @@ def render_parallel(checkpoint: str | None = None) -> Path:
     if not frames:
         raise RuntimeError("render() 一帧都没回 —— 检查 render_mode 与 viewer 配置")
     out = result_dir() / f"parallel-{tag}.png"
-    plt.imsave(out, frames[-1])
+    # 静帧取**第一帧**而不是最后一帧：预热之后步态已经起来、六只还都在画面里；
+    # 到最后一帧它们已经各自走开，那张图只剩一半。
+    plt.imsave(out, frames[0])
     video = result_dir() / f"parallel-{tag}.mp4"
     media.write_video(str(video), frames, fps=fps)
-    h, w = frames[-1].shape[:2]
+    h, w = frames[0].shape[:2]
     print(f"写出 {out} 与 {video}  ({w}×{h}，{PARALLEL_ENVS} 个环境，{len(frames)} 帧)")
     return out
 

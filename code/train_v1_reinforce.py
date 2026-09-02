@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import lightning as L
 import torch
@@ -20,8 +20,8 @@ import wandb
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import MAX_ITERATIONS, NUM_ENVS, DuckEnv, task_slug  # noqa: E402
-from model import ActorCritic  # noqa: E402
+from env import MAX_ITERATIONS, NUM_ENVS, DuckEnv, task_slug
+from model import ActorCritic
 
 
 def default_checkpoint_root(run_name: str) -> Path:

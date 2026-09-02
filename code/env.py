@@ -14,12 +14,11 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import torch
-
 # 导入即注册：这一行执行 mjlab_microduck 里所有 register_mjlab_task(...) 调用，
 # 之后 registry 才认得下面那些 task id。不靠 entry-point 自动发现，是为了让
 # "什么时候注册的" 这件事在代码里看得见。
 import mjlab_microduck.tasks  # noqa: F401
+import torch
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 
@@ -96,7 +95,7 @@ class DuckEnv:
     已经按自己的需要定好了，硬塞一个统一值会把 episodic 任务弄坏。
     """
 
-    def __init__(  # noqa: PLR0913 —— 这些是环境的实际自由度，硬合并成一个 cfg 只会多一层
+    def __init__(
         self,
         num_envs=NUM_ENVS,
         device="cuda:0",
@@ -107,9 +106,11 @@ class DuckEnv:
         render_size=None,
         camera_distance=None,
         camera_elevation=None,
+        camera_azimuth=None,
         camera_lookat=None,
         env_spacing=None,
         shadows=None,
+        camera_origin=None,
     ):
         if task not in list_tasks():
             raise ValueError(f"未注册的任务 {task!r}；可选值见 `python code/env.py`")
@@ -135,6 +136,16 @@ class DuckEnv:
             cfg.viewer.distance = camera_distance
         if camera_elevation is not None:
             cfg.viewer.elevation = camera_elevation
+        # 方位角：几个环境的原点是排成一条线的，默认 90 度会让那条线在画面里斜着走 ——
+        # 一头顶出边缘、另一头空一片。让相机从垂直于那条线的方向看，才横铺满画面。
+        if camera_azimuth is not None:
+            cfg.viewer.azimuth = camera_azimuth
+        # ⚠️ `lookat` 只在**自由相机**下生效。mjlab 的默认 origin_type 是 AUTO，
+        # 而 AUTO 的语义是「跟拍第一个非固定刚体」—— 跟拍模式下 MuJoCo 每帧用被跟刚体的
+        # 位置覆盖注视点，配置里的 lookat 就成了死值。实测证据：把 lookat 平移
+        # (1.12, -0.56) 米重渲，两张图逐像素相同。
+        # ⇒ 要对准一个**指定的点**（比如一群的中心）必须显式选 "world"；
+        #   要跟着一个**会走的机器人**就选 "asset_root"。两者不能混。
         if camera_lookat is not None:
             cfg.viewer.lookat = camera_lookat
         # 阴影与地面反射默认都开着。问题是这个场景是「25 厘米的机器人 + 一望无际的地面」，
@@ -143,6 +154,15 @@ class DuckEnv:
         if shadows is not None:
             cfg.viewer.enable_shadows = shadows
             cfg.viewer.enable_reflections = shadows
+        if camera_origin is not None:
+            origin_types = {
+                "world": cfg.viewer.OriginType.WORLD,        # 自由相机，看向 lookat
+                "asset_root": cfg.viewer.OriginType.ASSET_ROOT,  # 跟拍机器人根节点
+            }
+            cfg.viewer.origin_type = origin_types[camera_origin]
+            if camera_origin == "asset_root":
+                # 场景里不止一个实体（还有地形），跟拍必须点名跟谁。
+                cfg.viewer.entity_name = "robot"
 
         self.task = task
         resolved_device = device if torch.cuda.is_available() or device == "cpu" else "cpu"
