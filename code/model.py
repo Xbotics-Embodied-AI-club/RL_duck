@@ -4,7 +4,7 @@
 `train_v*.py` 里的 LightningModule；`compute_gae` 是 v2/v3 用来把时序差分残差
 平滑成优势的工具函数，v1 不用它。
 
-讲义对应：第14讲 5.4 节（v1 走读）、6.3 节（GAE）、6.4 节（v2 走读）。
+讲义对应：5.5 节（v1 代码走读）、6.3 节（GAE 的式子）、6.4 节（v2 代码走读）。
 """
 from __future__ import annotations
 

@@ -77,13 +77,22 @@ class DuckEnv:
     已经按自己的需要定好了，硬塞一个统一值会把 episodic 任务弄坏。
     """
 
-    def __init__(self, num_envs=NUM_ENVS, device="cuda:0", seed=None, render_mode=None, task=TASK):
+    def __init__(  # noqa: PLR0913 —— 这些是环境的实际自由度，硬合并成一个 cfg 只会多一层
+        self,
+        num_envs=NUM_ENVS,
+        device="cuda:0",
+        seed=None,
+        render_mode=None,
+        task=TASK,
+        max_extra_envs=0,
+    ):
         if task not in list_tasks():
             raise ValueError(f"未注册的任务 {task!r}；可选值见 `python code/env.py`")
         cfg = load_env_cfg(task)
         cfg.scene.num_envs = num_envs
         cfg.seed = seed
-        cfg.viewer.max_extra_envs = 0
+        # 训练与评测只渲第 0 个环境（省时间）；出「一屏一群鸭子」那张图时把它调大。
+        cfg.viewer.max_extra_envs = max_extra_envs
 
         self.task = task
         resolved_device = device if torch.cuda.is_available() or device == "cpu" else "cpu"
