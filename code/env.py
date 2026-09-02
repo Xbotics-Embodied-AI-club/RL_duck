@@ -11,6 +11,7 @@ actor 和 critic 各自那一份。三个训练版本共用本文件，对照时
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -25,7 +26,11 @@ from mjlab.tasks.registry import list_tasks, load_env_cfg
 # ============================ 这一轮跑什么 ============================
 # 全仓唯一的任务声明处。改这一行就是换一个动作；结果目录与权重目录都从它派生，
 # 所以不同任务的产物不会互相覆盖。可选值用 `python code/env.py` 打印。
-TASK = "Mjlab-Velocity-Flat-MicroDuck"
+_DEFAULT_TASK = "Mjlab-Velocity-Flat-MicroDuck"
+# 批量跑的时候（一台机器七张卡、每卡一个任务）用环境变量按进程覆盖 ——
+# 模块级常量是一份，七个并发进程要各跑不同任务，只能从进程环境里取。
+# 讲义里「改一行换任务」说的是单次运行，不受这个影响。
+TASK = os.environ.get("RL_DUCK_TASK") or _DEFAULT_TASK
 
 # 并行环境数。三级阶梯的对照要求三个版本用同一个值，所以它声明在这里、
 # 不写在各 train 脚本的 main() 里——写三份就会漂。
@@ -37,7 +42,8 @@ NUM_ENVS = 4096
 # 从 -0.1 分段拉到 -1.0、**到第 1500 迭代才到位**，跑 3000 就只有一半时间是在
 # 最终那套奖励下学的，三档对照会被这件事污染。上游 playbook 给步态类的量级是
 # 4000–6000；episodic 的动作类 1000 上下，换任务时把这里改成 2000 即可。
-MAX_ITERATIONS = 6000
+_DEFAULT_MAX_ITERATIONS = 6000
+MAX_ITERATIONS = int(os.environ.get("RL_DUCK_MAX_ITERATIONS") or _DEFAULT_MAX_ITERATIONS)
 # =====================================================================
 
 
@@ -97,6 +103,7 @@ class DuckEnv:
         camera_elevation=None,
         camera_lookat=None,
         env_spacing=None,
+        shadows=None,
     ):
         if task not in list_tasks():
             raise ValueError(f"未注册的任务 {task!r}；可选值见 `python code/env.py`")
@@ -124,6 +131,12 @@ class DuckEnv:
             cfg.viewer.elevation = camera_elevation
         if camera_lookat is not None:
             cfg.viewer.lookat = camera_lookat
+        # 阴影与地面反射默认都开着。问题是这个场景是「25 厘米的机器人 + 一望无际的地面」，
+        # 阴影贴图的深度范围被地面撑得极大、精度不够，渲出来是一道道横向条纹（阴影失真）。
+        # 出图时一律关掉：格子地板本身就够表达空间关系，条纹只会让人以为画面坏了。
+        if shadows is not None:
+            cfg.viewer.enable_shadows = shadows
+            cfg.viewer.enable_reflections = shadows
 
         self.task = task
         resolved_device = device if torch.cuda.is_available() or device == "cpu" else "cpu"

@@ -89,7 +89,20 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
     json_output = out_dir / f"{run_name}.json"
     video_output = out_dir / f"{run_name}.mp4"
 
-    env = DuckEnv(num_envs=num_envs, device=device, seed=seed, render_mode="rgb_array")
+    # 分辨率与取景必须显式给。mjlab 的默认是 320×240、相机 5 米外近乎水平 ——
+    # 那样录出来的评测视频里鸭子只有几十像素、上面还压着一条黑边，而且它不报错。
+    # 这里与关键帧用同一套取景，两者才对得上。
+    env = DuckEnv(
+        num_envs=num_envs,
+        device=device,
+        seed=seed,
+        render_mode="rgb_array",
+        shadows=False,
+        render_size=(960, 720),
+        camera_distance=0.8,
+        camera_elevation=-15.0,
+        camera_lookat=(0.0, 0.0, 0.18),
+    )
     rewards, action_abs_means, frames = [], [], []
     done_count = 0
     try:

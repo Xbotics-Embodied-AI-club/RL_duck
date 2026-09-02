@@ -71,7 +71,7 @@ KEYFRAME_LOOKAT = (0.0, 0.0, 0.18)
 PARALLEL_ENVS = 6
 # 先跑一会儿让姿态散开，别都停在初始站姿；但也别跑太久 ——
 # 它们会各自走开，队形散了就框不住了。
-PARALLEL_WARMUP_STEPS = 90
+PARALLEL_WARMUP_STEPS = 45
 
 # 关键帧序列：横排几帧、总共跑多少步、从第几步开始取。
 KEYFRAME_COUNT = 5
@@ -208,6 +208,7 @@ def render_parallel(checkpoint: str | None = None) -> Path:
         render_mode="rgb_array",
         max_extra_envs=PARALLEL_ENVS - 1,
         env_spacing=PARALLEL_SPACING,
+        shadows=False,
         render_size=PARALLEL_SIZE,
         camera_distance=distance,
         camera_elevation=PARALLEL_ELEVATION,
@@ -256,6 +257,7 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
         device="cuda:0",
         seed=1,
         render_mode="rgb_array",
+        shadows=False,
         render_size=KEYFRAME_SIZE,
         camera_distance=KEYFRAME_DISTANCE,
         camera_elevation=KEYFRAME_ELEVATION,
