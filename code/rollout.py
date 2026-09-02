@@ -44,7 +44,8 @@ def load_policy(checkpoint, device):
         device: 模型放到哪个设备上。
 
     Returns:
-        (模型, 该 checkpoint 对应的训练迭代数)。
+        (模型, 该 checkpoint 对应的训练迭代数, 那次训练的全部设置)。设置一并回传是因为
+        评测还要用它把环境的课程表对齐到同一档（见 `align_curriculum`）。
     """
     data = torch.load(checkpoint, map_location="cpu", weights_only=False)
     settings = data.get("training_settings", {})
@@ -56,7 +57,35 @@ def load_policy(checkpoint, device):
     model.load_state_dict(data["actor_critic"])
     model.eval()
     model.to(device)
-    return model, int(data.get("iteration", -1))
+    return model, int(data.get("iteration", -1)), settings
+
+
+def align_curriculum(env, iteration, settings) -> int:
+    """把环境的课程表对齐到这份权重训练到的那一档，**必须在 reset 之前调**。
+
+    不对齐会让评测系统性地把任务测简单：课程表按环境步分段，新建环境从第 0 步开始，
+    于是起身那档评测时"仰躺"这种初始姿态的概率是 0（它要到第 600 迭代才开始出现），
+    各惩罚项也停在最轻的一档。数字照样出、图照样渲、脚本照样退 0。
+
+    档位不用另存一个字段：每次迭代恰好推进 `num_steps_per_env` 个环境步，
+    所以第 N 档权重对应 N × num_steps_per_env 步，从 checkpoint 里已有的两个字段就能算。
+
+    Args:
+        env: 已建好、**还没 reset** 的 `DuckEnv`。
+        iteration: checkpoint 的迭代号。
+        settings: checkpoint 里的 `training_settings`。
+
+    Returns:
+        对齐到的环境步数；算不出来（老 checkpoint 缺字段）时返回 0 并保持原样。
+    """
+    steps_per_iter = int(settings.get("num_steps_per_env", 0))
+    if iteration <= 0 or steps_per_iter <= 0:
+        print("课程表未对齐：checkpoint 里没有迭代号或每轮步数，按第 0 档评测。")
+        return 0
+    step = iteration * steps_per_iter
+    env.set_curriculum_step(step)
+    print(f"课程表对齐到第 {step} 环境步（迭代 {iteration} × 每轮 {steps_per_iter} 步）。")
+    return step
 
 
 def _recorded_frame(frame) -> np.ndarray:
@@ -105,15 +134,31 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         camera_origin="asset_root",
     )
     rewards, action_abs_means, frames = [], [], []
+    # 逐项奖励：mjlab 把每一项的回合累计放在 extras["log"] 里。总奖励会骗人 ——
+    # 它可能全靠正则项在涨而目标动作从没发生，所以要看**主任务那一项**。
+    # 这些任务都没有定义成功率指标（它们是连续奖励任务，不是成败任务），
+    # 逐项奖励是我们能拿到的最接近「有没有做成那件事」的东西。
+    term_sums: dict[str, float] = {}
+    term_count = 0
     done_count = 0
     try:
-        model, iteration = load_policy(checkpoint, env.device)
+        model, iteration, settings = load_policy(checkpoint, env.device)
+        # 顺序是硬的：先对齐课程表，再 reset —— 初始姿态的混合是在 reset 那一刻按
+        # 当前档位抽的，reset 之后再改就只能影响下一个回合。
+        curriculum_step = align_curriculum(env, iteration, settings)
         obs, _critic_obs = env.reset()
         for _ in range(num_steps):
             with torch.no_grad():
                 actions = model.act_inference(obs)
-            obs, _critic_obs, reward, done, _info = env.step(actions)
+            obs, _critic_obs, reward, done, info = env.step(actions)
             rewards.append(float(reward.mean().detach().cpu()))
+            log = info.get("mjlab_extras", {}).get("log", {})
+            if log:
+                term_count += 1
+                for key, value in log.items():
+                    term_sums[key] = term_sums.get(key, 0.0) + float(
+                        value.mean() if hasattr(value, "mean") else value
+                    )
             action_abs_means.append(float(actions.detach().abs().mean().cpu()))
             done_count += int(done.detach().sum().cpu())
             frame = env.render()
@@ -126,6 +171,7 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         "run_name": run_name,
         "checkpoint": str(Path(checkpoint)),
         "checkpoint_iteration": iteration,
+        "curriculum_step": curriculum_step,
         "video_output": str(video_output),
         "video_frames": len(frames),
         "num_envs": int(num_envs),
@@ -134,6 +180,7 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         "action_abs_mean": float(sum(action_abs_means) / len(action_abs_means)) if action_abs_means else 0.0,
         "done_count": int(done_count),
         "done_fraction": float(done_count / (num_envs * num_steps)) if num_envs and num_steps else 0.0,
+        "reward_terms": {k: v / term_count for k, v in sorted(term_sums.items())} if term_count else {},
     }
     json_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 

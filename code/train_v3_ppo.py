@@ -5,9 +5,14 @@
   2. 一段 rollout 切成多个 minibatch、训多个 epoch，样本效率更高；
   3. 按 KL 散度自适应调整学习率，更新步长自动收放。
 这就是 BeyondMimic 用的那套核心，直接套到 小鸭子任务上。
+
+再加一件只有**部分任务**要的：左右对称的镜像一致性损失（见 `mirror_loss`）。
+奖励表、课程表、域随机化都在环境侧、由 mjlab 内部驱动，训练器免费继承；
+对称性增广是唯一一件在**算法侧**的，环境不会替我们做，必须写在这里。
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -17,10 +22,11 @@ from pathlib import Path
 import lightning as L
 import torch
 import wandb
+from tensordict import TensorDict
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import MAX_ITERATIONS, NUM_ENVS, DuckEnv, task_slug
+from env import MAX_ITERATIONS, NUM_ENVS, DuckEnv, task_slug, task_symmetry_cfg
 from model import ActorCritic, compute_gae
 
 
@@ -65,6 +71,36 @@ def adapt_learning_rate_to_kl(optimizer, kl, desired_kl, min_lr=1.0e-5, max_lr=1
         current_lr = min(max_lr, current_lr * 1.5)
     optimizer.param_groups[0]["lr"] = current_lr
     return current_lr
+
+
+def resolve_mirror_function(symmetry_cfg):
+    """把任务声明的镜像函数从"点分路径"变成可调用的函数。
+
+    路径是任务配置里的一个字符串（`"包.模块.函数"`），不是我们这边的一个 import ——
+    照抄成 import 就等于在这里复制了一份声明，上游换函数那天会静默用旧的那个。
+    不用镜像损失的任务返回 None。
+
+    Args:
+        symmetry_cfg: 任务声明的 symmetry 配置字典，可以是 None。
+
+    Returns:
+        (镜像函数, 损失系数)；不启用时是 (None, 0.0)。
+
+    Raises:
+        RuntimeError: 配置说要用镜像损失，但没给镜像函数的路径。
+    """
+    if not symmetry_cfg or not symmetry_cfg.get("use_mirror_loss"):
+        return None, 0.0
+    dotted = symmetry_cfg.get("data_augmentation_func")
+    if not dotted:
+        raise RuntimeError(
+            "任务声明了 use_mirror_loss，但没给 data_augmentation_func —— "
+            "镜像函数只能从任务的声明里取，本训练器不替它猜一个。"
+        )
+    module_name, _, attr = dotted.rpartition(".")
+    return getattr(importlib.import_module(module_name), attr), float(
+        symmetry_cfg.get("mirror_loss_coeff", 0.5)
+    )
 
 
 def save_checkpoint(path, model, optimizer, iteration, training_settings):
@@ -265,7 +301,7 @@ class DuckLightningPPO(L.LightningModule):
     """只负责一个 minibatch 的 PPO loss、记录与保存；更新循环交给 Lightning。"""
 
     def __init__(self, model, run_name, max_iterations, save_interval, checkpoint_dir,
-                 training_settings, wandb_project, wandb_mode):
+                 training_settings, wandb_project, wandb_mode, symmetry_cfg=None):
         super().__init__()
         self.model = model
         self.run_name = run_name
@@ -287,6 +323,7 @@ class DuckLightningPPO(L.LightningModule):
         self.entropy_coef = 0.01
         self.learning_rate = 1.0e-3
         self.desired_kl = 0.01
+        self.mirror_function, self.mirror_loss_coeff = resolve_mirror_function(symmetry_cfg)
 
     def setup(self, stage):
         """训练开始前建好权重目录并起一个 W&B run。
@@ -328,7 +365,7 @@ class DuckLightningPPO(L.LightningModule):
         Returns:
             本步的 loss。
         """
-        loss, policy_loss, value_loss, entropy_loss, kl = self.loss_for_batch(mini_batch)
+        loss, policy_loss, value_loss, entropy_loss, kl, mirror = self.loss_for_batch(mini_batch)
         self.latest_kl = kl.detach()
         record = {
             "reward": float(mini_batch["reward_mean"].detach().cpu()),
@@ -337,6 +374,7 @@ class DuckLightningPPO(L.LightningModule):
             "policy_loss": float(policy_loss.detach().cpu()),
             "entropy": float(entropy_loss.detach().cpu()),
             "kl": float(kl.detach().cpu()),
+            "mirror_loss": float(mirror.detach().cpu()),
         }
         self.epoch_records.append(record)
         self.log_dict(record, prog_bar=True, on_step=True, on_epoch=False)
@@ -361,8 +399,49 @@ class DuckLightningPPO(L.LightningModule):
             self.latest_checkpoint = self.checkpoint_dir / f"model_{iteration}.pt"
             save_checkpoint(self.latest_checkpoint, self.model, self.optimizer, iteration, self.training_settings)
 
+    def mirror_loss(self, obs, critic_obs, action_means):
+        """算左右镜像的一致性损失：把镜子里的观测喂进去，应当得到镜子里的动作。
+
+        为什么它必须写在算法侧：这不是一条奖励，而是加在 loss 上的一项约束
+        —— 「策略函数本身应当与左右镜像可交换」。环境不知道网络长什么样，替不了这件事。
+
+        用它的理由（上游前滚翻那档的实测经验）：前滚翻是严格左右对称的动作，而策略很容易
+        学成往一侧塌 —— 那是一条能量更低的斜路，正着翻要经过完全倒立的姿态。镜像一致性
+        把"左偏"和"右偏"这两个解绑在一起，斜路的优势就消失了。左右不对称的任务
+        （比如单脚踢球）绝不能开，它会直接把正确答案罚掉。
+
+        镜像的排列与符号表由任务那一侧提供（61 维观测哪一位和哪一位换、哪几位要变号），
+        我们这边只负责调用与算差 —— 那张表属于机器人的关节布局，不属于训练器。
+
+        Args:
+            obs: 一批 actor 观测。
+            critic_obs: 同一批的 critic 观测；镜像函数按 TensorDict 收两组，故一并传入。
+            action_means: 当前策略在 `obs` 上给出的动作均值。
+
+        Returns:
+            标量的镜像一致性损失；未启用镜像损失时是一个 0。
+        """
+        if self.mirror_function is None:
+            return torch.zeros((), device=obs.device)
+        batch_size = obs.shape[0]
+        augmented, _ = self.mirror_function(
+            None,
+            TensorDict(
+                {"actor": obs, "critic": critic_obs},
+                batch_size=[batch_size],
+                device=obs.device,
+            ),
+            None,
+        )
+        _, mirrored_actions = self.mirror_function(None, None, action_means)
+        # 镜像函数把结果拼成 [原始; 镜像] 两半，我们只要后一半。
+        mirrored_obs = augmented["actor"][batch_size:]
+        target = mirrored_actions[batch_size:].detach()
+        predicted = self.model.action_distribution(mirrored_obs).mean
+        return torch.square(predicted - target).mean()
+
     def loss_for_batch(self, batch):
-        """算一个 minibatch 上的三项 loss 与 KL。
+        """算一个 minibatch 上的各项 loss 与 KL。
 
         KL 在 `no_grad` 下算：它只用来调学习率，不参与反向传播。
 
@@ -370,7 +449,7 @@ class DuckLightningPPO(L.LightningModule):
             batch: 一个 minibatch。
 
         Returns:
-            (总 loss, 策略 loss, 价值 loss, 熵, KL)。
+            (总 loss, 策略 loss, 价值 loss, 熵, KL, 镜像 loss)。
         """
         log_probs, entropy, values, action_means = self.model.evaluate(
             batch["obs"], batch["critic_obs"], batch["actions"]
@@ -393,8 +472,14 @@ class DuckLightningPPO(L.LightningModule):
         policy_loss = -torch.min(unclipped, clipped).mean()
         value_loss = self.value_loss(values, batch["values"], batch["returns"])
         entropy_loss = entropy.mean()
-        loss = policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_loss
-        return loss, policy_loss, value_loss, entropy_loss, kl
+        mirror = self.mirror_loss(batch["obs"], batch["critic_obs"], action_means)
+        loss = (
+            policy_loss
+            + self.value_loss_coef * value_loss
+            - self.entropy_coef * entropy_loss
+            + self.mirror_loss_coeff * mirror
+        )
+        return loss, policy_loss, value_loss, entropy_loss, kl, mirror
 
     def value_loss(self, values, old_values, returns):
         """critic 的回归损失，可选对新估值做对称裁剪。
@@ -453,6 +538,9 @@ def run_training(run_name, num_envs, max_iterations, num_steps_per_env, save_int
     policy = ActorCritic(obs_dim=env.obs_dim, critic_obs_dim=env.critic_obs_dim, action_dim=env.action_dim)
     policy.to(env.device)
 
+    # 对称性只有任务自己知道要不要（前滚翻要，其余十几个都不要），所以问注册表。
+    symmetry_cfg = task_symmetry_cfg(env.task)
+
     training_settings = {
         "run_name": run_name, "num_envs": num_envs, "max_iterations": max_iterations,
         "num_steps_per_env": num_steps_per_env, "save_interval": save_interval, "device": device,
@@ -460,11 +548,12 @@ def run_training(run_name, num_envs, max_iterations, num_steps_per_env, save_int
         "wandb_mode": wandb_mode, "gamma": gamma, "lam": lam,
         "num_learning_epochs": num_learning_epochs, "num_mini_batches": num_mini_batches,
         "obs_dim": env.obs_dim, "critic_obs_dim": env.critic_obs_dim, "action_dim": env.action_dim,
+        "task": env.task, "symmetry": symmetry_cfg,
     }
 
     data = DuckData(env, policy, num_steps_per_env, gamma, lam, num_learning_epochs, num_mini_batches)
     model = DuckLightningPPO(policy, run_name, max_iterations, save_interval, checkpoint_dir,
-                               training_settings, wandb_project, wandb_mode)
+                               training_settings, wandb_project, wandb_mode, symmetry_cfg)
     trainer = L.Trainer(
         accelerator="gpu" if device != "cpu" and torch.cuda.is_available() else "cpu",
         devices=1,

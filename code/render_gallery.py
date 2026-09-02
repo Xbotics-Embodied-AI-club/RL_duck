@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from env import TASK, DuckEnv, task_slug
 from model import ActorCritic
 from plot_reward_curves import use_project_font
-from rollout import load_policy
+from rollout import align_curriculum, load_policy
 
 # ======================== 这一轮渲什么 ========================
 # 权重文件。留空就自动取当前 TASK 的 PPO 那一档**最新**的 checkpoint；
@@ -82,10 +82,11 @@ PARALLEL_ENVS = 6
 PARALLEL_PREROLL = 12
 PARALLEL_RECORD = 1000
 
-# 关键帧序列：横排几帧、总共跑多少步、从第几步开始取。
+# 关键帧序列：横排几帧。取帧的**窗口**不是常量，按任务的回合长度算（见 keyframe_window）。
 KEYFRAME_COUNT = 5
+# 长回合、周期性动作（走路）的取帧窗口：跳掉启动瞬态，再取一段。
 KEYFRAME_STEPS = 260
-KEYFRAME_SKIP = 60  # 前若干步是 reset 后的过渡，动作还没起来
+KEYFRAME_SKIP = 60
 
 # 开篇拼图：按这个顺序摆格子。每个元素是一个 task slug，
 # 对应 `result/<slug>/keyframes.png` 必须已经渲好。缺哪个就跳过哪个。
@@ -205,6 +206,32 @@ def result_dir(slug: str | None = None) -> Path:
     return d
 
 
+def keyframe_window(env: DuckEnv) -> tuple[int, int]:
+    """按任务的回合长度算出关键帧该在哪一段里取。
+
+    **这里曾经是一个真正让人看不见结果的坑。** 原先窗口写死成「跳过前 60 步、
+    在 260 步里取 5 帧」—— 那是按**走路**定的：走路的回合 20 秒（1000 步），
+    前 60 步是从初始站姿起步的瞬态，跳掉正好。
+
+    但起身、坐站、前滚翻这些是 episodic 任务，回合只有 5–6 秒（250–300 步），
+    而那个动作**整个发生在前 60 步里**（实测：起身在第 15 步就已经站直）。
+    按走路的窗口渲，5 帧全落在动作结束之后，画面上是一只一动不动趴着的鸭子 ——
+    而图照样出、脚本照样退 0。「动作没出现」有一部分是量具看不见它。
+
+    判据只有一条：回合本身比走路那个窗口还短，就说明动作在回合里，从第 0 步整段看。
+
+    Args:
+        env: 已建好的环境。
+
+    Returns:
+        (跳过多少步, 总共跑多少步)。
+    """
+    episode = env.episode_steps
+    if episode <= KEYFRAME_STEPS:
+        return 0, episode
+    return KEYFRAME_SKIP, KEYFRAME_STEPS
+
+
 def make_policy(env: DuckEnv, checkpoint: str | None):
     """给出一个能出动作的策略：有权重就加载，没有就随机初始化。
 
@@ -218,7 +245,10 @@ def make_policy(env: DuckEnv, checkpoint: str | None):
         (策略, 说明字符串)，说明字符串写进文件名后缀，免得把验证图当结果图。
     """
     if checkpoint:
-        model, iteration = load_policy(checkpoint, env.device)
+        model, iteration, settings = load_policy(checkpoint, env.device)
+        # 与 rollout 同一口径：出图前把课程表对齐到这份权重训练到的那一档，
+        # 否则渲的是「第 0 档课程下的初始姿态」，不是这份权重实际面对的分布。
+        align_curriculum(env, iteration, settings)
         return model, f"iter{iteration}"
     model = ActorCritic(
         obs_dim=env.obs_dim, critic_obs_dim=env.critic_obs_dim, action_dim=env.action_dim
@@ -330,8 +360,10 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
     frames: list[np.ndarray] = []
     try:
         model, tag = make_policy(env, checkpoint)
+        skip, steps = keyframe_window(env)
+        print(f"关键帧窗口：跳过 {skip} 步、跑 {steps} 步（回合共 {env.episode_steps} 步）")
         obs, _critic = env.reset()
-        for _ in range(KEYFRAME_STEPS):
+        for _ in range(steps):
             with torch.no_grad():
                 actions = model.act_inference(obs)
             obs, _critic, _r, _d, _i = env.step(actions)
@@ -341,7 +373,7 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
     finally:
         env.close()
 
-    usable = frames[KEYFRAME_SKIP:] or frames
+    usable = frames[skip:] or frames
     if not usable:
         raise RuntimeError("render() 一帧都没回 —— 检查 render_mode 与 viewer 配置")
     picks = np.linspace(0, len(usable) - 1, KEYFRAME_COUNT).round().astype(int)
@@ -353,7 +385,7 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
         ax.imshow(img)
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_xlabel(f"第 {int(idx) + KEYFRAME_SKIP} 步", fontsize=8)
+        ax.set_xlabel(f"第 {int(idx) + skip} 步", fontsize=8)
     fig.suptitle(TASK.removeprefix("Mjlab-").replace("-MicroDuck", ""), fontsize=10)
     fig.tight_layout()
     out = result_dir() / f"keyframes-{tag}.png"

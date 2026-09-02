@@ -18,7 +18,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
-import env as duck_env  # noqa: E402
+import env as duck_env
 
 # 讲义第 2 节写死了这两个数字，正文里的每一处解释都依赖它们。
 # 上游改了观测布局，这里要红。
@@ -35,7 +35,15 @@ PLANNED_TASKS = (
     "Mjlab-BallKick-Flat-MicroDuck",
     "Mjlab-SitStand-Flat-MicroDuck",
     "Mjlab-GroundPick-Flat-MicroDuck",
+    "Mjlab-Roulade-Flat-MicroDuck",
 )
+
+# 观测里第 6–19 位是 14 个关节的相对角。镜像表对这一段的置换与符号，和对**动作**的
+# 置换与符号是同一份（`symmetry.py` 里 `_OBS_PERM[6:20] = 6 + _JOINT_PERM`），
+# 所以"把这一段读出来当动作"这个策略是**严格左右等变**的 —— 下面用它当正对照。
+_JOINT_POS_SLICE = slice(6, 20)
+# 而这一段（角速度 3 + 重力 3 + 前 8 个关节）跨过了不同的置换块，不等变，当反对照。
+_MIXED_SLICE = slice(0, 14)
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="MuJoCo Warp 需要 CUDA")
 
@@ -60,6 +68,83 @@ def test_unknown_task_fails_loudly():
     """任务名写错要当场报错，不许悄悄回落到默认任务。"""
     with pytest.raises(ValueError, match="未注册的任务"):
         duck_env.DuckEnv(num_envs=2, task="Mjlab-No-Such-Task")
+
+
+def test_symmetry_is_declared_by_the_task_not_by_us():
+    """对称性开关只有前滚翻是开的，而且值是从 mjlab 注册表读的。
+
+    这一条守的是"不在训练器里另抄一份任务名到开关的表"：如果哪天有人把开关硬编码
+    过来，上游改了之后这里会红。
+    """
+    roulade = duck_env.task_symmetry_cfg("Mjlab-Roulade-Flat-MicroDuck")
+    assert roulade is not None, "前滚翻应当声明了对称性增广"
+    assert roulade["use_mirror_loss"] is True
+    assert roulade["mirror_loss_coeff"] > 0
+    assert "symmetry" in roulade["data_augmentation_func"]
+
+    for task in ("Mjlab-StandUp-Flat-MicroDuck", "Mjlab-BallKick-Flat-MicroDuck"):
+        assert duck_env.task_symmetry_cfg(task) is None, f"{task} 不该开对称性"
+
+
+class _SliceActor(torch.nn.Module):
+    """把观测的某一段直接当动作输出的假 actor，用来构造一个已知等变性的策略。"""
+
+    def __init__(self, where: slice):
+        super().__init__()
+        self.where = where
+
+    def forward(self, obs):
+        """取出那一段。
+
+        Args:
+            obs: 一批观测。
+
+        Returns:
+            观测里 `self.where` 那一段。
+        """
+        return obs[:, self.where]
+
+
+def _mirror_loss_of(actor_slice, tmp_path):
+    """拿一个"读出观测某一段当动作"的策略，算它的镜像一致性损失。
+
+    归一化统计量保持在初始值（均值 0、方差 1），此时 `normalize_actor` 只是乘一个
+    标量，等变性不受影响 —— 这一点是本对照能成立的前提。
+
+    Args:
+        actor_slice: 要读出的观测段。
+        tmp_path: pytest 给的临时目录，只用来满足构造函数。
+
+    Returns:
+        标量损失值。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
+    from model import ActorCritic
+    from train_v3_ppo import DuckLightningPPO
+
+    torch.manual_seed(0)
+    policy = ActorCritic(obs_dim=61, critic_obs_dim=61, action_dim=14)
+    policy.actor = _SliceActor(actor_slice)
+    module = DuckLightningPPO(
+        model=policy, run_name="t", max_iterations=1, save_interval=1,
+        checkpoint_dir=tmp_path, training_settings={}, wandb_project="t", wandb_mode="offline",
+        symmetry_cfg=duck_env.task_symmetry_cfg("Mjlab-Roulade-Flat-MicroDuck"),
+    )
+    obs = torch.randn(8, 61)
+    means = policy.action_distribution(obs).mean
+    return float(module.mirror_loss(obs, obs, means))
+
+
+def test_mirror_loss_vanishes_exactly_for_an_equivariant_policy(tmp_path):
+    """严格左右等变的策略，镜像损失必须是 0；不等变的必须明显大于 0。
+
+    这两条一起才有意义。只测"等变的是 0"抓不到"把拼接结果取错了一半"这类错
+    —— 取错一半时算的是 ‖μ(o) − 镜像(μ(o))‖²，对随机观测它不是 0，会被反对照抓到。
+    """
+    equivariant = _mirror_loss_of(_JOINT_POS_SLICE, tmp_path)
+    mixed = _mirror_loss_of(_MIXED_SLICE, tmp_path)
+    assert equivariant < 1e-10, f"等变策略的镜像损失应当是 0，实得 {equivariant}"
+    assert mixed > 0.1, f"不等变策略的镜像损失应当明显大于 0，实得 {mixed}"
 
 
 @needs_cuda

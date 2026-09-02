@@ -20,7 +20,7 @@ from typing import Any
 import mjlab_microduck.tasks  # noqa: F401
 import torch
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
-from mjlab.tasks.registry import list_tasks, load_env_cfg
+from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
 
 # ============================ 这一轮跑什么 ============================
 # 全仓唯一的任务声明处。改这一行就是换一个动作；结果目录与权重目录都从它派生，
@@ -65,6 +65,26 @@ def task_slug(task: str = TASK) -> str:
     """
     name = task.removeprefix("Mjlab-").replace("-MicroDuck", "")
     return name.strip("-").lower()
+
+
+def task_symmetry_cfg(task: str = TASK) -> dict | None:
+    """取任务自己声明的左右对称性增广配置。
+
+    对称性是**算法侧**的东西（一个镜像一致性损失，加在 PPO 的 loss 上），不像奖励表和
+    课程表那样由 mjlab 内部驱动 —— 所以训练器必须自己去问任务要不要它。十几个任务里
+    只有前滚翻声明了 True（那个动作是严格左右对称的，镜像一致性正好压住"往一侧塌"）。
+
+    值从 mjlab 的任务注册表里取，不在这边另列一份任务名到开关的表：注册表是唯一声明处，
+    抄一份出来就会在上游改了开关那天静默失配。
+
+    Args:
+        task: mjlab 的 task id，默认取模块级的 `TASK`。
+
+    Returns:
+        任务声明的 symmetry 配置字典；任务没有声明（或声明为关）时返回 None。
+    """
+    algorithm = getattr(load_rl_cfg(task), "algorithm", None)
+    return getattr(algorithm, "symmetry_cfg", None)
 
 
 def split_actor_critic_obs(obs):
@@ -184,6 +204,37 @@ class DuckEnv:
             未经包装的 mjlab 环境。
         """
         return self._env
+
+    @property
+    def episode_steps(self) -> int:
+        """一个回合有多少步。
+
+        各任务不一样（走路 20 秒 = 1000 步，起身 6 秒 = 300 步，前滚翻 5 秒 = 250 步），
+        唯一声明处是任务配置里的 `episode_length_s`，所以只能问环境要，不能写一个常量。
+
+        Returns:
+            回合长度（控制步数）。
+        """
+        return int(self._env.max_episode_length)
+
+    def set_curriculum_step(self, step: int) -> None:
+        """把课程表的进度计数器搬到指定的环境步，用于评测时对齐训练时的那一档。
+
+        **这是评测口径的一个真坑。** 课程表（初始姿态混合、域随机化幅度、各惩罚项的权重）
+        全都按 `env.common_step_counter` 分段，而这个计数器在新建的环境里从 0 开始。
+        于是不做对齐时，无论评测的是第几万迭代的权重，环境给的都是**第 0 档**：
+        起身那档在第 0 档根本不出现"仰躺"这种初始姿态（它的概率是 0，要到第 600 迭代
+        才开始出现），惩罚项也还是最轻的一档。结果就是评测**系统性地把任务测简单了**、
+        奖励数字也和训练日志不可比 —— 而它不报错，图照样出、json 照样写。
+
+        上游的 runner 把这个计数器存进 checkpoint、续训时再恢复（`mjlab/rl/runner.py`
+        里的 `env_state`），正是为了这件事。我们不存它，因为它可以从已有字段算出来：
+        每次迭代恰好推进 `num_steps_per_env` 步，所以第 N 档权重对应 N × num_steps_per_env。
+
+        Args:
+            step: 要对齐到的环境步数，通常是 `迭代数 × num_steps_per_env`。
+        """
+        self._env.common_step_counter = int(step)
 
     def reset(self):
         """重置全部并行环境，开始新一轮回合。
