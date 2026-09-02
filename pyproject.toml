@@ -25,11 +25,60 @@ dependencies = [
     "numpy",
     # rollout 录像与关键帧序列（与 handbook 的 rollout.py 用同一个库，代码才好逐字复用）
     "mediapy",
+    # 镜像增广函数按 TensorDict 收发观测组，所以 train_v3 直接 import 它。
+    # 它同时也是 mjlab 的传递依赖 —— 但传递依赖不是声明：mjlab 哪天不再需要它，
+    # `uv sync` 依旧成功，而 `from tensordict import TensorDict` 会 ModuleNotFoundError，
+    # 且只在跑前滚翻（唯一开镜像损失的任务）时才炸，别的任务全过。
+    "tensordict",
 ]
 
 [dependency-groups]
 # `uv sync` 默认会装 dev 组，所以冒烟测试开箱就能跑（不用 `uv run --with pytest`）。
-dev = ["pytest"]
+# ruff 也进 dev：判据要跟着仓库走，不能靠敲命令的人记得 `--with ruff`。
+dev = ["pytest", "ruff"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ruff —— 判据从主仓 experiment_main_v1/pyproject.toml 的 canonical 配置搬过来。
+#
+# 为什么非配不可：没有 `[tool.ruff]` 时 `ruff check` 只跑默认那四组（E4/E7/E9/F），
+# 于是"全绿"这句话字面上不成立 —— 它绿的是一份**没人选定**的判据。
+# 实测：换上 canonical 之后立刻多出 7 条 ARG002，其中一条不是风格问题
+# （`on_before_optimizer_step` 丢掉 Lightning 传进来的 optimizer，见那个函数的注释）。
+# 一份会被学员照抄工程规矩的材料，判据不能是"默认值"。
+#
+# 与主仓的唯一差异是 `target-version`：本仓 `requires-python` 钉 >=3.12,<3.13
+# （上游 microduck_rl 经 bam 钉的），所以写 py312 而不是主仓的 py311。
+# 这不是口径分歧，是本仓解释器版本的事实。主仓那条 `extend-exclude = ["vendored"]`
+# 也没搬 —— 本仓没有 vendored/，留着就是给一条不存在的路径配规则。
+# ─────────────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E",      # pycodestyle 错误
+  "F",      # pyflakes：未定义的名字、未用的 import
+  "I",      # isort：import 顺序确定化
+  "B",      # bugbear：可变默认参数等真 bug
+  "UP",     # pyupgrade
+  "C4",     # 推导式
+  "SIM",    # 可简化的写法
+  "S110",   # try-except-pass      ← 静默吞异常
+  "S112",   # try-except-continue  ← 同上
+  "BLE",    # 捕获过宽的异常
+  "ARG",    # 未使用的参数（常是接口没对齐的信号）
+  "PT",     # pytest 风格
+  "RUF100", # 过期的 `# noqa`（挂着却已无对应告警 = 注释在说谎）
+]
+ignore = ["E501"]   # 行长交给 formatter，不在 lint 里报
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许 assert；也允许重复 —— DAMP 优先于 DRY。
+"**/tests/**" = ["S101", "ARG"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.uv]
 package = false

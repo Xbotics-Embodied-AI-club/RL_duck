@@ -77,14 +77,24 @@ def task_symmetry_cfg(task: str = TASK) -> dict | None:
     值从 mjlab 的任务注册表里取，不在这边另列一份任务名到开关的表：注册表是唯一声明处，
     抄一份出来就会在上游改了开关那天静默失配。
 
+    `.algorithm` 直接取属性、不用 `getattr(..., None)`：上游改名时要当场 `AttributeError`。
+    用默认值兜住它是这里最危险的写法 —— 兜住的结果是**镜像损失整个静默关掉**，
+    而十几个任务里有十几个本来就返回 None，看日志分不出"这个任务不需要"和"字段名找不到了"。
+
+    `symmetry_cfg` 那一层保留 `getattr` 默认值，因为**缺席就是"不启用"是上游自己的语义**：
+    只有前滚翻用的 `PpoWithSymmetryCfg` 有这个字段，其余任务用的基类 `RslRlPpoAlgorithmCfg`
+    根本没有它。这不是我们的兜底，是在读上游的两种配置类型。
+
     Args:
         task: mjlab 的 task id，默认取模块级的 `TASK`。
 
     Returns:
-        任务声明的 symmetry 配置字典；任务没有声明（或声明为关）时返回 None。
+        任务声明的 symmetry 配置字典；任务用的是不带该字段的基类配置时返回 None。
+
+    Raises:
+        AttributeError: 上游的 runner 配置不再有 `algorithm` 字段。
     """
-    algorithm = getattr(load_rl_cfg(task), "algorithm", None)
-    return getattr(algorithm, "symmetry_cfg", None)
+    return getattr(load_rl_cfg(task).algorithm, "symmetry_cfg", None)
 
 
 def split_actor_critic_obs(obs):
@@ -134,6 +144,17 @@ class DuckEnv:
     ):
         if task not in list_tasks():
             raise ValueError(f"未注册的任务 {task!r}；可选值见 `python code/env.py`")
+        # `camera_lookat` 只在自由相机（`camera_origin="world"`）下生效，理由见下面
+        # 那段实测注释。签名是扁平的、表达不出参数之间的依赖，所以这条约束只能在这里
+        # 机械化 —— 而它已经付过一次代价：出关键帧的那处传了 lookat、没传 origin，
+        # 于是 lookat 是死值，而画面看着是对的（跟拍恰好把鸭子放中间），没人会发现。
+        # 前提不成立就抛错，不要什么都不发生。
+        if camera_lookat is not None and camera_origin != "world":
+            raise ValueError(
+                "camera_lookat 只在 camera_origin='world' 下生效（跟拍模式下 MuJoCo 每帧用被跟"
+                f"刚体的位置覆盖注视点）。当前 camera_origin={camera_origin!r}："
+                "要对准一个指定的点就传 camera_origin='world'；要跟着机器人就用 'asset_root' 并去掉 lookat。"
+            )
         cfg = load_env_cfg(task)
         cfg.scene.num_envs = num_envs
         cfg.seed = seed
@@ -217,6 +238,21 @@ class DuckEnv:
         """
         return int(self._env.max_episode_length)
 
+    @property
+    def episode_seconds(self) -> float:
+        """一个回合有多少秒，也就是任务配置里的 `episode_length_s`。
+
+        为什么要露出"秒"而不只是"步"：判断一个任务是 episodic（那个动作**就是**整个回合）
+        还是周期性的（走路，回合只是个时长上限），是关于**任务性质**的判断，用秒表达才读得懂。
+        用步数去判会被"一步等于多少秒"这件事拐一道弯 —— 实测踩过：拿出图窗口的 260 步
+        当阈值，起身的 300 步回合就被判成了"长回合"，于是那个只有 0.3 秒的起身动作
+        照旧落在取帧窗口之外。阈值和绘图长度是两件事，混用一个数就会这样。
+
+        Returns:
+            回合时长（秒）。
+        """
+        return float(self._env.max_episode_length_s)
+
     def set_curriculum_step(self, step: int) -> None:
         """把课程表的进度计数器搬到指定的环境步，用于评测时对齐训练时的那一档。
 
@@ -266,13 +302,19 @@ class DuckEnv:
             actions: 形状 (N, 14) 的关节目标量。
 
         Returns:
-            (actor 观测, critic 观测, 奖励, done, 附加信息)。附加信息里保留了
-            未合并的 `time_outs`，PPO 版本要用它给超时的回合补一段自举回报。
+            (actor 观测, critic 观测, 奖励, done, 附加信息)。附加信息里**两个原始信号
+            都保留**：`time_outs`（PPO 版本用它给超时的回合补一段自举回报）与
+            `terminated`（评测要用它把"摔了"和"时间到了"分开 —— 合并后的 `dones`
+            分不出这两件事，而短回合的 episodic 任务里超时是常态）。
         """
         obs, rewards, terminated, time_outs, extras = self._env.step(actions)
         dones = torch.logical_or(terminated, time_outs)
         actor_obs, critic_obs = split_actor_critic_obs(obs)
-        return actor_obs, critic_obs, rewards, dones, {"time_outs": time_outs, "mjlab_extras": extras}
+        return actor_obs, critic_obs, rewards, dones, {
+            "time_outs": time_outs,
+            "terminated": terminated,
+            "mjlab_extras": extras,
+        }
 
     def render(self):
         """渲染一帧画面，录 rollout 视频与出关键帧序列时用。

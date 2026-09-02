@@ -234,11 +234,14 @@ class DuckLightningA2C(L.LightningModule):
 
         Args:
             batch: 采样端产出的一整段数据。
-            batch_idx: Lightning 传入的批序号，本实现用不到。
+            batch_idx: Lightning 传入的批序号。签名是 Lightning 规定的，形参名不能改；
+                本实现按顺序消费数据、不需要序号，所以显式 `del` 掉它 ——
+                留着不用会被 lint 判为"接口没对齐"，而这里是真的不需要。
 
         Returns:
             本步的 loss。
         """
+        del batch_idx
         log_probs, entropy, values, _means = self.model.evaluate(
             batch["obs"], batch["critic_obs"], batch["actions"]
         )
@@ -268,8 +271,10 @@ class DuckLightningA2C(L.LightningModule):
         """训练结束后收尾，把 W&B run 正常关掉。
 
         Args:
-            stage: Lightning 传入的阶段名。
+            stage: Lightning 传入的阶段名。签名由 Lightning 规定；收尾不分阶段，
+                所以显式 `del` 掉，免得"未用形参"被读成接口没对齐。
         """
+        del stage
         if self.wandb_run is not None:
             self.wandb_run.finish()
 

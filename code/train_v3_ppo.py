@@ -73,21 +73,77 @@ def adapt_learning_rate_to_kl(optimizer, kl, desired_kl, min_lr=1.0e-5, max_lr=1
     return current_lr
 
 
-def resolve_mirror_function(symmetry_cfg):
-    """把任务声明的镜像函数从"点分路径"变成可调用的函数。
+def check_mirror_contract(mirror_function, obs_dim, action_dim) -> None:
+    """开训前验一次镜像函数的两条契约，不满足就停下。
+
+    为什么值得花这几行：镜像损失依赖一张 61 维观测的置换与符号表（哪一位和哪一位换、
+    哪几位变号），表由任务那一侧提供。**表接错了不会让训练崩** —— 它照样收敛，
+    只是收敛到一个错的对称约束上，于是前滚翻继续往一侧塌，而那正是当初开镜像损失
+    要修的现象。到那时没人分得清是"镜像损失没用"还是"镜像表接错了"。
+
+    两条契约：
+      ① 镜像是对合的：镜两次回到原值。表里有一位的符号或配对写错，这条就破。
+      ② 返回值的前一半是原始输入。`mirror_loss` 靠切后一半拿镜像结果，
+         这条同时把那个切片约定钉住 —— 上游哪天改成 [镜像; 原始] 会当场报错，
+         而不是安静地把损失算成 0。
+
+    Args:
+        mirror_function: 已解析出来的镜像函数。
+        obs_dim: actor 观测维度。
+        action_dim: 动作维度。
+
+    Raises:
+        RuntimeError: 任一条契约不成立。
+    """
+    probe = torch.randn(4, obs_dim)
+    critic_probe = torch.randn(4, obs_dim)
+    once, _ = mirror_function(
+        None, TensorDict({"actor": probe, "critic": critic_probe}, batch_size=[4]), None
+    )
+    if not torch.allclose(once["actor"][:4], probe, atol=1e-6):
+        raise RuntimeError(
+            "镜像函数返回值的前一半不等于输入 —— [原始; 镜像] 这个拼接约定变了。"
+            "mirror_loss 靠切后一半取镜像结果，约定一变损失就算错，而训练照样跑。"
+        )
+    mirrored = once["actor"][4:]
+    twice, _ = mirror_function(
+        None, TensorDict({"actor": mirrored, "critic": critic_probe}, batch_size=[4]), None
+    )
+    if not torch.allclose(twice["actor"][4:], probe, atol=1e-6):
+        raise RuntimeError(
+            "镜像两次没有回到原值 —— 61 维观测的置换或符号表有位写错了。"
+            "这种错不会让训练崩，只会让它收敛到一个错的对称约束上。"
+        )
+    actions = torch.randn(4, action_dim)
+    _, act_once = mirror_function(None, None, actions)
+    _, act_twice = mirror_function(None, None, act_once[4:])
+    if not torch.allclose(act_once[:4], actions, atol=1e-6) or not torch.allclose(
+        act_twice[4:], actions, atol=1e-6
+    ):
+        raise RuntimeError("动作侧的镜像表不满足「前一半是原始」或「镜两次回到原值」。")
+
+
+def resolve_mirror_function(symmetry_cfg, obs_dim=None, action_dim=None):
+    """把任务声明的镜像函数从"点分路径"变成可调用的函数，并当场验一次它的契约。
 
     路径是任务配置里的一个字符串（`"包.模块.函数"`），不是我们这边的一个 import ——
     照抄成 import 就等于在这里复制了一份声明，上游换函数那天会静默用旧的那个。
     不用镜像损失的任务返回 None。
 
+    上游那个函数的第一个形参是 `env`，而它的 docstring 明写"未使用，只为接口兼容"，
+    所以调用处一律传 `None`；这是照着上游的声明来的，不是漏了。
+
     Args:
         symmetry_cfg: 任务声明的 symmetry 配置字典，可以是 None。
+        obs_dim: actor 观测维度，给出时会跑一次契约自检。
+        action_dim: 动作维度，同上。
 
     Returns:
         (镜像函数, 损失系数)；不启用时是 (None, 0.0)。
 
     Raises:
-        RuntimeError: 配置说要用镜像损失，但没给镜像函数的路径。
+        RuntimeError: 配置说要用镜像损失，但没给镜像函数的路径或没给系数；
+            或者镜像函数的契约自检不通过。
     """
     if not symmetry_cfg or not symmetry_cfg.get("use_mirror_loss"):
         return None, 0.0
@@ -97,10 +153,17 @@ def resolve_mirror_function(symmetry_cfg):
             "任务声明了 use_mirror_loss，但没给 data_augmentation_func —— "
             "镜像函数只能从任务的声明里取，本训练器不替它猜一个。"
         )
+    # 系数同样不给兜底值：凭空写一个 0.5 会在上游改键名那天静默改掉约束的强度。
+    if "mirror_loss_coeff" not in symmetry_cfg:
+        raise RuntimeError(
+            "任务声明了 use_mirror_loss，但没给 mirror_loss_coeff —— "
+            "约束强度必须由声明处给出，本训练器不替它定一个。"
+        )
     module_name, _, attr = dotted.rpartition(".")
-    return getattr(importlib.import_module(module_name), attr), float(
-        symmetry_cfg.get("mirror_loss_coeff", 0.5)
-    )
+    mirror_function = getattr(importlib.import_module(module_name), attr)
+    if obs_dim is not None and action_dim is not None:
+        check_mirror_contract(mirror_function, obs_dim, action_dim)
+    return mirror_function, float(symmetry_cfg["mirror_loss_coeff"])
 
 
 def save_checkpoint(path, model, optimizer, iteration, training_settings):
@@ -323,7 +386,13 @@ class DuckLightningPPO(L.LightningModule):
         self.entropy_coef = 0.01
         self.learning_rate = 1.0e-3
         self.desired_kl = 0.01
-        self.mirror_function, self.mirror_loss_coeff = resolve_mirror_function(symmetry_cfg)
+        self.latest_lr = self.learning_rate
+        # 维度从模型自己身上取，不另传一遍 —— 契约自检要造和真实观测同形的探针。
+        self.mirror_function, self.mirror_loss_coeff = resolve_mirror_function(
+            symmetry_cfg,
+            obs_dim=int(model.actor_mean.shape[0]),
+            action_dim=int(model.action_dim),
+        )
 
     def setup(self, stage):
         """训练开始前建好权重目录并起一个 W&B run。
@@ -360,11 +429,14 @@ class DuckLightningPPO(L.LightningModule):
 
         Args:
             mini_batch: 数据集吐出的一个 minibatch。
-            batch_idx: Lightning 传入的批序号，本实现用不到。
+            batch_idx: Lightning 传入的批序号。签名是 Lightning 规定的，形参名不能改；
+                本实现按顺序消费数据、不需要序号，所以显式 `del` 掉它 ——
+                留着不用会被 lint 判为"接口没对齐"，而这里是真的不需要。
 
         Returns:
             本步的 loss。
         """
+        del batch_idx
         loss, policy_loss, value_loss, entropy_loss, kl, mirror = self.loss_for_batch(mini_batch)
         self.latest_kl = kl.detach()
         record = {
@@ -383,16 +455,30 @@ class DuckLightningPPO(L.LightningModule):
     def on_before_optimizer_step(self, optimizer):
         """每次真正迈步之前，先按 KL 把学习率调好。
 
+        调的是**Lightning 传进来的那个** optimizer，而不是 `self.optimizer`。
+        今天两者是同一个对象（已核实：Lightning 的包装器 `LightningOptimizer.step` 把
+        `self._optimizer` —— 原始的 Adam —— 传下去，钩子收到的就是它），所以两种写法
+        都能跑。但改学习率必须改在"Lightning 真的会 step 的那个对象"上：一旦引入
+        LR scheduler、梯度累积或精度插件，`self.optimizer` 就可能不再是被 step 的那个，
+        于是 KL 自适应静默失效、训练照跑。
+
         Args:
-            optimizer: Lightning 传入的优化器。
+            optimizer: Lightning 传入的优化器，就是本步会被 step 的那一个。
         """
-        adapt_learning_rate_to_kl(self.optimizer, self.latest_kl, self.desired_kl)
+        self.latest_lr = adapt_learning_rate_to_kl(optimizer, self.latest_kl, self.desired_kl)
 
     def on_train_epoch_end(self):
         """把本轮各 minibatch 的指标平均后上报，并按需存盘。"""
+        if not self.epoch_records:
+            return
         iteration = self.current_epoch + 1
-        metrics = {key: sum(r[key] for r in self.epoch_records) / len(self.epoch_records) for key in self.epoch_records[0]}
-        metrics["lr"] = self.optimizer.param_groups[0]["lr"]
+        metrics = {
+            key: sum(r[key] for r in self.epoch_records) / len(self.epoch_records)
+            for key in self.epoch_records[0]
+        }
+        # 学习率取上一次调整时的返回值，不再去 param_groups 里另读一遍 ——
+        # 同一个事实两处各算一次，改了一处就会不一致。
+        metrics["lr"] = self.latest_lr
         wandb.log(metrics, step=iteration)
         append_metrics(self.checkpoint_dir / "metrics.jsonl", iteration, metrics)
         if iteration % self.save_interval == 0 or iteration == self.max_iterations:
@@ -503,8 +589,10 @@ class DuckLightningPPO(L.LightningModule):
         """训练结束后收尾，把 W&B run 正常关掉。
 
         Args:
-            stage: Lightning 传入的阶段名。
+            stage: Lightning 传入的阶段名。签名由 Lightning 规定；收尾不分阶段，
+                所以显式 `del` 掉，免得"未用形参"被读成接口没对齐。
         """
+        del stage
         if self.wandb_run is not None:
             self.wandb_run.finish()
 

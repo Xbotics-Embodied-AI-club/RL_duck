@@ -86,6 +86,64 @@ def test_symmetry_is_declared_by_the_task_not_by_us():
         assert duck_env.task_symmetry_cfg(task) is None, f"{task} 不该开对称性"
 
 
+def test_episodic_tasks_get_the_whole_episode_in_keyframes():
+    """每个任务被分到哪一类取帧窗口，逐个钉死。
+
+    这一条抓的是一次真错：第一版阈值借用了绘图长度 260 步，而起身的回合是 300 步，
+    于是它被判成"长回合"、照旧跳掉前 60 步 —— 而起身在第 15 步就已经站直。
+    改完代码没看图，就会以为修好了。阈值改成按秒判之后，这里把分类逐任务锁住。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
+    from render_gallery import EPISODIC_THRESHOLD_SECONDS, keyframe_window
+
+    class _FakeEnv:
+        def __init__(self, seconds):
+            self.episode_seconds = seconds
+            self.episode_steps = int(seconds * 50)
+
+    # 走路：20 秒，周期性动作 ⇒ 跳掉启动瞬态。
+    skip, steps = keyframe_window(_FakeEnv(20.0))
+    assert skip > 0, "走路那种长回合应当跳掉启动瞬态"
+    assert steps < 20.0 * 50, "走路不该把整个 20 秒都渲一遍"
+
+    # episodic 那几个（起身 6 秒、坐站 6 秒、前滚翻 5 秒）⇒ 整段、从第 0 步。
+    for seconds in (6.0, 5.0):
+        skip, steps = keyframe_window(_FakeEnv(seconds))
+        assert skip == 0, f"{seconds} 秒的回合应当从第 0 步看，实得 skip={skip}"
+        assert steps == int(seconds * 50), f"{seconds} 秒的回合应当整段看，实得 {steps} 步"
+
+    # 阈值本身要把这两簇分开，别贴着任一边。
+    assert 6.0 < EPISODIC_THRESHOLD_SECONDS < 20.0
+
+
+def test_lookat_without_world_camera_is_rejected():
+    """`camera_lookat` 只在自由相机下生效，传错组合要当场报错。
+
+    守的是一次真事故：出关键帧那处传了 lookat、没传 camera_origin，于是走 mjlab 默认的
+    跟拍模式、lookat 成了死值 —— 而画面看着是对的（跟拍恰好把鸭子放中间），所以没人发现，
+    注释还写着"实测比出来的"。前提不成立时必须有人喊，不能什么都不发生。
+    """
+    with pytest.raises(ValueError, match="camera_lookat 只在"):
+        duck_env.DuckEnv(num_envs=2, camera_lookat=(0.0, 0.0, 0.18))
+    with pytest.raises(ValueError, match="camera_lookat 只在"):
+        duck_env.DuckEnv(num_envs=2, camera_lookat=(0.0, 0.0, 0.18), camera_origin="asset_root")
+
+
+def test_curriculum_alignment_refuses_to_guess():
+    """算不出课程表档位时要抛错，不许回落到第 0 档。
+
+    第 0 档正是这个函数要修的错（评测会系统性地把任务测简单），所以"算不出来就按第 0 档"
+    等于把已知错误的口径当默认值。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
+    from rollout import align_curriculum
+
+    with pytest.raises(RuntimeError, match="课程表对不齐"):
+        align_curriculum(env=None, iteration=2000, settings={})
+    with pytest.raises(RuntimeError, match="课程表对不齐"):
+        align_curriculum(env=None, iteration=-1, settings={"num_steps_per_env": 24})
+
+
 class _SliceActor(torch.nn.Module):
     """把观测的某一段直接当动作输出的假 actor，用来构造一个已知等变性的策略。"""
 

@@ -53,32 +53,34 @@ CHECKPOINT: str | None = os.environ.get("RL_DUCK_CHECKPOINT") or None
 PARALLEL_SIZE = (1600, 900)
 KEYFRAME_SIZE = (960, 720)
 
-# 相机的量，实测比出来的。三个量一起调才有用：默认视线几乎水平，
-# 地平线落在画面中间、上面三四成是纯黑的天；而 lookat 钉在地面原点，
-# 鸭子沉在画面下缘。
-#   单只：0.8 米 / 俯 15 度，视线抬到躯干高度，关节和脚都看得清。
-#   一群：**只渲 6 只，而且把它们摆得挨近**。
-#        踩过两次坑才对：32 只那版每只都是小点；改成 6 只之后仍然小 ——
-#        因为我退相机去"装下"它们，而任务默认的环境间距本来就有十几米宽。
-#        正确的杠杆是**改间距**，不是退相机：每个环境是独立的物理世界，
-#        间距只影响画面偏移与地形分片查询，平地上纯属视觉安排。
+# 相机的量，实测比出来的。默认视线几乎水平，地平线落在画面中间、上面三四成是纯黑的天，
+# 所以距离与俯角必须显式给。
+#   单只：0.8 米 / 俯 15 度，跟拍躯干（`camera_origin="asset_root"`）。
+#        **这一档没有 lookat**：跟拍模式下 MuJoCo 每帧用被跟刚体的位置覆盖注视点，
+#        配置里的 lookat 是死值（`env.py` 里那条实测：平移 lookat 1.12/−0.56 米重渲，
+#        两张图逐像素相同）。跟拍本身就把鸭子放在画面中央，抬视线这件事不需要 lookat。
+#   一群：**只渲 6 只，而且把它们摆得挨近**。环境默认间距十几米，退相机去"装下"它们
+#        只会让每只都成小点（32 只那版、6 只那版都实测过）。正确的杠杆是改间距：
+#        每个环境是独立的物理世界，间距只影响画面偏移与地形分片查询，平地上纯属视觉安排。
+#        这一档用世界固定相机 + lookat 对准群体中心，lookat 在那里才真的起作用。
 PARALLEL_SPACING = 0.8
 PARALLEL_ELEVATION = -22.0
 KEYFRAME_DISTANCE = 0.8
 KEYFRAME_ELEVATION = -15.0
-KEYFRAME_LOOKAT = (0.0, 0.0, 0.18)
 
 # 并行仿真图开多少个环境（全都画进画面）。
 # 六只：既表达了"不止一只、各自在学"，每只又还看得清在做什么。
 PARALLEL_ENVS = 6
-# 预热与录制**必须分开两个数**。之前它们是同一个：为了让队形别散，我把这个数
+# 预热与录制**必须分开两个数**。之前它们是同一个：为了让队形别散，把这个数
 # 从 150 砍到 45，顺手把视频从 3 秒砍成了 0.9 秒 —— 一个常量管着两件事。
 # 预热只是等步态起来（一个步态周期约 20 步），录制才决定视频多长。
-# ⚠️ 上限来自任务本身，实测过：六只各拿一个**不同的**随机速度指令，所以它们必然走散。
-# 200 帧（4 秒）跑完只剩 3 只还在画面里 —— 我先前以为 4 秒还框得住，量了才知道不行。
-# 预热 12 步（约半个步态周期）让它们不是僵在初始站姿；录 1000 帧（20 秒）。
-# 长镜头是安全的，两条实测支撑：160 步里最远两只从 2.50 米收到 2.03 米（往中间聚、
-# 不是散开），群体中心只漂 13 厘米；而且相机是跟拍的（track_robot），不是固定机位。
+# ⚠️ 这一档是**世界固定相机**（见 render_parallel 里的 camera_origin="world"），不是跟拍。
+# 固定机位下能录多长由"六只走不走散"决定，而它们必然走散 —— 每只拿一个**不同的**随机
+# 速度指令。实测的上限是 200 帧（4 秒）：跑完只剩 3 只还在画面里。
+# 现在给的 1000 帧（20 秒）**超过那个上限**，所以视频后段基本是空地板。
+# 这是有意接受的：静帧取的是 frames[0]（`render_parallel` 里），不受影响；
+# 那段 mp4 只当"很多只在各自跑"的动态素材，不要求全程六只都在框内。
+# 要一段全程满画面的视频就把它改成 200。
 PARALLEL_PREROLL = 12
 PARALLEL_RECORD = 1000
 
@@ -87,6 +89,14 @@ KEYFRAME_COUNT = 5
 # 长回合、周期性动作（走路）的取帧窗口：跳掉启动瞬态，再取一段。
 KEYFRAME_STEPS = 260
 KEYFRAME_SKIP = 60
+# 判定"这是 episodic 任务还是周期性任务"的阈值，单位是**秒**。
+# 它必须与 KEYFRAME_STEPS 分开，而且不能用步数表达 —— 两条都是实测踩出来的：
+#   · 一个常量管两件事：先前用 KEYFRAME_STEPS 兼作阈值，改绘图长度就会改掉任务分类。
+#   · 用步数当阈值判错了：260 步的阈值把起身的 300 步（6 秒）回合判成"长回合"，
+#     于是那个 0.3 秒就完成的起身动作照旧落在窗口外，五帧仍然逐帧相同。
+# 本任务族的实际分布：走路 20 秒；起身 6 秒、坐站 6 秒、前滚翻 5 秒、取物与踢球同量级。
+# 10 秒落在这两簇中间，两边都留着一倍余量。
+EPISODIC_THRESHOLD_SECONDS = 10.0
 
 # 开篇拼图：按这个顺序摆格子。每个元素是一个 task slug，
 # 对应 `result/<slug>/keyframes.png` 必须已经渲好。缺哪个就跳过哪个。
@@ -218,7 +228,8 @@ def keyframe_window(env: DuckEnv) -> tuple[int, int]:
     按走路的窗口渲，5 帧全落在动作结束之后，画面上是一只一动不动趴着的鸭子 ——
     而图照样出、脚本照样退 0。「动作没出现」有一部分是量具看不见它。
 
-    判据只有一条：回合本身比走路那个窗口还短，就说明动作在回合里，从第 0 步整段看。
+    判据只有一条，而且是关于**任务性质**的：回合短（episodic，动作就是这一个回合）
+    就从第 0 步把整段看完；回合长（周期性动作，回合只是个时长上限）才跳掉启动瞬态。
 
     Args:
         env: 已建好的环境。
@@ -226,9 +237,8 @@ def keyframe_window(env: DuckEnv) -> tuple[int, int]:
     Returns:
         (跳过多少步, 总共跑多少步)。
     """
-    episode = env.episode_steps
-    if episode <= KEYFRAME_STEPS:
-        return 0, episode
+    if env.episode_seconds <= EPISODIC_THRESHOLD_SECONDS:
+        return 0, env.episode_steps
     return KEYFRAME_SKIP, KEYFRAME_STEPS
 
 
@@ -355,13 +365,20 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
         render_size=KEYFRAME_SIZE,
         camera_distance=KEYFRAME_DISTANCE,
         camera_elevation=KEYFRAME_ELEVATION,
-        camera_lookat=KEYFRAME_LOOKAT,
+        # 显式跟拍躯干。不给这个参数时 mjlab 走默认的 AUTO（跟拍第一个非固定刚体），
+        # 画面恰好也对 —— 于是"取景到底是我们定的还是撞上的"分不出来。
+        # 一份教学材料里，参数生效与不生效必须看得出来。
+        camera_origin="asset_root",
     )
     frames: list[np.ndarray] = []
     try:
         model, tag = make_policy(env, checkpoint)
         skip, steps = keyframe_window(env)
-        print(f"关键帧窗口：跳过 {skip} 步、跑 {steps} 步（回合共 {env.episode_steps} 步）")
+        print(
+            f"关键帧窗口：跳过 {skip} 步、跑 {steps} 步"
+            f"（回合 {env.episode_seconds:.1f} 秒 = {env.episode_steps} 步，"
+            f"episodic 阈值 {EPISODIC_THRESHOLD_SECONDS:.0f} 秒）"
+        )
         obs, _critic = env.reset()
         for _ in range(steps):
             with torch.no_grad():

@@ -4,6 +4,12 @@
 环境、同样 16 个并行环境跑 400 步、一律取确定性动作。口径统一，版本之间的数字
 才可比。摘要写成 `result/<task-slug>/<run>.json`，视频写成同名 `.mp4`。
 
+**"摔倒率"这个词只对得上 `terminated_fraction`，不对 `done_fraction`。** 环境把
+"摔倒终止"和"超时截断"合并成一个 `done` 返回（对回报截断的作用相同），而这里评测
+要区分它们：走路是长回合、400 步内几乎不超时，把 `done` 当摔倒读恰好没错；但起身、
+坐站、前滚翻的回合只有 250–300 步，400 步里必然超时重置，那时 `done` 里绝大部分是
+"时间到了"。把它当摔倒率写进讲义，就是把一个纯由回合长度决定的数字当成策略质量。
+
 讲义对应：1.5 节（评测口径）、5.5 节（关联代码）。
 """
 from __future__ import annotations
@@ -76,12 +82,22 @@ def align_curriculum(env, iteration, settings) -> int:
         settings: checkpoint 里的 `training_settings`。
 
     Returns:
-        对齐到的环境步数；算不出来（老 checkpoint 缺字段）时返回 0 并保持原样。
+        对齐到的环境步数。
+
+    Raises:
+        RuntimeError: checkpoint 里缺迭代号或每轮步数，算不出档位。**不回落到第 0 档** ——
+            那正是本函数要修的错，回落等于把已知错误的口径当成默认值继续跑，
+            而那一行提示会被几百步的进度刷过去。三份训练脚本写 `training_settings`
+            时这两个键必带，所以缺字段只可能是 checkpoint 不是本仓产的。
     """
     steps_per_iter = int(settings.get("num_steps_per_env", 0))
     if iteration <= 0 or steps_per_iter <= 0:
-        print("课程表未对齐：checkpoint 里没有迭代号或每轮步数，按第 0 档评测。")
-        return 0
+        raise RuntimeError(
+            "课程表对不齐：checkpoint 里 "
+            f"iteration={iteration!r}、training_settings['num_steps_per_env']={steps_per_iter!r}，"
+            "至少有一个缺失或非正。评测必须知道这份权重训到了课程表的哪一档 —— "
+            "按第 0 档跑会系统性地把任务测简单，而且不报错。"
+        )
     step = iteration * steps_per_iter
     env.set_curriculum_step(step)
     print(f"课程表对齐到第 {step} 环境步（迭代 {iteration} × 每轮 {steps_per_iter} 步）。")
@@ -140,7 +156,10 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
     # 逐项奖励是我们能拿到的最接近「有没有做成那件事」的东西。
     term_sums: dict[str, float] = {}
     term_count = 0
-    done_count = 0
+    # 回合是怎么结束的，两种分开数。`terminated & ~time_outs` 才是"摔了/被判失败"；
+    # 光看合并后的 done，短回合任务会把每次超时重置都记成一次摔倒。
+    terminated_count = 0
+    timeout_count = 0
     try:
         model, iteration, settings = load_policy(checkpoint, env.device)
         # 顺序是硬的：先对齐课程表，再 reset —— 初始姿态的混合是在 reset 那一刻按
@@ -150,8 +169,14 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         for _ in range(num_steps):
             with torch.no_grad():
                 actions = model.act_inference(obs)
-            obs, _critic_obs, reward, done, info = env.step(actions)
+            obs, _critic_obs, reward, _done, info = env.step(actions)
             rewards.append(float(reward.mean().detach().cpu()))
+            time_outs = info["time_outs"]
+            terminated = info["terminated"]
+            # 同一步里两个信号可能同时为真（撞上边界那一步刚好也超时），
+            # 那一次回合结束只算一次，归给"终止"这一类。
+            terminated_count += int(terminated.detach().sum().cpu())
+            timeout_count += int((time_outs & ~terminated).detach().sum().cpu())
             log = info.get("mjlab_extras", {}).get("log", {})
             if log:
                 term_count += 1
@@ -160,7 +185,6 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
                         value.mean() if hasattr(value, "mean") else value
                     )
             action_abs_means.append(float(actions.detach().abs().mean().cpu()))
-            done_count += int(done.detach().sum().cpu())
             frame = env.render()
             if frame is not None:
                 frames.append(_recorded_frame(frame))
@@ -178,8 +202,18 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         "steps": int(num_steps),
         "mean_reward": float(sum(rewards) / len(rewards)) if rewards else 0.0,
         "action_abs_mean": float(sum(action_abs_means) / len(action_abs_means)) if action_abs_means else 0.0,
-        "done_count": int(done_count),
-        "done_fraction": float(done_count / (num_envs * num_steps)) if num_envs and num_steps else 0.0,
+        # 分母是**回合数**，不是环境步数：说"率"的时候想的是"多少个回合是摔着结束的"。
+        # 一个回合都没结束（走路 400 步不到一个回合长度）时两个率都给 0，
+        # 而 episodes = 0 这个字段会把"没有样本"和"零摔倒"区分开。
+        "episodes": int(terminated_count + timeout_count),
+        "terminated_count": int(terminated_count),
+        "timeout_count": int(timeout_count),
+        "terminated_fraction": float(terminated_count / (terminated_count + timeout_count))
+        if (terminated_count + timeout_count)
+        else 0.0,
+        "timeout_fraction": float(timeout_count / (terminated_count + timeout_count))
+        if (terminated_count + timeout_count)
+        else 0.0,
         "reward_terms": {k: v / term_count for k, v in sorted(term_sums.items())} if term_count else {},
     }
     json_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
