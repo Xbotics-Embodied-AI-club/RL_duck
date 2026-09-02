@@ -19,7 +19,7 @@ import wandb
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import NUM_ENVS, DuckEnv, task_slug  # noqa: E402
+from env import MAX_ITERATIONS, NUM_ENVS, DuckEnv, task_slug  # noqa: E402
 from model import ActorCritic, compute_gae  # noqa: E402
 
 
@@ -466,7 +466,7 @@ def main():
     run_training(
         run_name=f"{task_slug()}-ppo",
         num_envs=NUM_ENVS,
-        max_iterations=3000,
+        max_iterations=MAX_ITERATIONS,
         num_steps_per_env=24,
         save_interval=200,
         device="cuda:0",

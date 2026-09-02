@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import DuckEnv, task_slug  # noqa: E402
+from env import MAX_ITERATIONS, DuckEnv, task_slug  # noqa: E402
 from model import ActorCritic  # noqa: E402
 
 
@@ -136,7 +136,10 @@ def main():
 
     # 对三个版本各跑一遍对照（用各自最终 checkpoint）。
     slug = task_slug()
-    runs = {f"{slug}-{algo}": f"{slug}-{algo}/model_3000.pt" for algo in ("reinforce", "a2c", "ppo")}
+    runs = {
+        f"{slug}-{algo}": f"{slug}-{algo}/model_{MAX_ITERATIONS}.pt"
+        for algo in ("reinforce", "a2c", "ppo")
+    }
     for run_name, rel in runs.items():
         checkpoint = trained / rel
         if not checkpoint.exists():
