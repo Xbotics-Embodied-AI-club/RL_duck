@@ -94,22 +94,36 @@ class DuckEnv:
         max_extra_envs=0,
         render_size=None,
         camera_distance=None,
+        camera_elevation=None,
+        camera_lookat=None,
+        env_spacing=None,
     ):
         if task not in list_tasks():
             raise ValueError(f"未注册的任务 {task!r}；可选值见 `python code/env.py`")
         cfg = load_env_cfg(task)
         cfg.scene.num_envs = num_envs
         cfg.seed = seed
+        # 环境之间的摆放间距。每个环境是一份独立的物理世界，间距只影响画面上的偏移
+        # 与地形分片查询 —— 平地任务上把它调小纯属视觉安排，不改物理。
+        # 出「几只一起」那张图时把它压小，鸭子才挨得近、拍得大。
+        if env_spacing is not None:
+            cfg.scene.env_spacing = env_spacing
         # 训练与评测只渲第 0 个环境（省时间）；出「一屏一群鸭子」那张图时把它调大。
         cfg.viewer.max_extra_envs = max_extra_envs
         # mjlab 的默认渲染分辨率是 320×240 —— 够看不够印。要进讲义的图必须显式放大，
         # 否则渲出来的东西照样能存成 PNG、脚本照样退 0，只是印在纸上是一团马赛克。
         if render_size is not None:
             cfg.viewer.width, cfg.viewer.height = render_size
-        # 相机默认距离 5 米、俯角 45 度，对一只 25 厘米高的鸭子来说单只太小、一群又装不下。
-        # 单只关键帧要拉近，一群的全景要拉远。
+        # 相机默认距离 5 米、看向原点。对一只 25 厘米高的鸭子来说：单只太小、一群又装不下，
+        # 而且默认视线几乎水平 —— 地平线落在画面中间，上面三四成是纯黑的天。
+        # 三个量一起调才有用：拉近/拉远（distance）、往下看（elevation）、
+        # 把视线抬到鸭子躯干高度而不是地面（lookat）。
         if camera_distance is not None:
             cfg.viewer.distance = camera_distance
+        if camera_elevation is not None:
+            cfg.viewer.elevation = camera_elevation
+        if camera_lookat is not None:
+            cfg.viewer.lookat = camera_lookat
 
         self.task = task
         resolved_device = device if torch.cuda.is_available() or device == "cpu" else "cpu"

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -89,6 +90,24 @@ def save_checkpoint(path, model, optimizer, iteration, training_settings):
         },
         path,
     )
+
+
+def append_metrics(path, iteration, metrics):
+    """把这一迭代的指标追加成一行 JSON。
+
+    为什么不只依赖 W&B：离线 run 的指标写在一个二进制 `.wandb` 文件里，
+    那是内部格式、没有稳定的读接口（实测拿 wandb 的内部 datastore 直接解会
+    DecodeError）。而训练曲线是讲义的交付物之一，不能押在一个读不出来的文件上。
+    一行 JSON 的代价可以忽略，换来的是「不装 wandb、不联网也能出图」。
+
+    Args:
+        path: 目标 `.jsonl` 文件路径。
+        iteration: 当前迭代号。
+        metrics: 本次迭代的指标字典。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"iteration": iteration, **metrics}, sort_keys=True) + "\n")
 
 
 class DuckRolloutDataset(IterableDataset):
@@ -337,6 +356,7 @@ class DuckLightningPPO(L.LightningModule):
         metrics = {key: sum(r[key] for r in self.epoch_records) / len(self.epoch_records) for key in self.epoch_records[0]}
         metrics["lr"] = self.optimizer.param_groups[0]["lr"]
         wandb.log(metrics, step=iteration)
+        append_metrics(self.checkpoint_dir / "metrics.jsonl", iteration, metrics)
         if iteration % self.save_interval == 0 or iteration == self.max_iterations:
             self.latest_checkpoint = self.checkpoint_dir / f"model_{iteration}.pt"
             save_checkpoint(self.latest_checkpoint, self.model, self.optimizer, iteration, self.training_settings)

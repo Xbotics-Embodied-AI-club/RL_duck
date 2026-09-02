@@ -40,7 +40,10 @@ from plot_reward_curves import use_project_font  # noqa: E402
 from rollout import load_policy  # noqa: E402
 
 # ======================== 这一轮渲什么 ========================
-# 权重文件。留空（None）就用随机初始化的策略 —— 只为验证版面，别拿它当结果图。
+# 权重文件。留 None 就自动取当前 TASK 的 PPO 那一档**最新**的 checkpoint；
+# 一个都没有（还没开训）就退回随机初始化的策略，只为验证版面 ——
+# 那种图文件名带 untrained 后缀，别拿它当结果图。
+# 想钉某一个具体的 checkpoint，把路径写在这里。
 CHECKPOINT: str | None = None
 
 # 渲染分辨率。mjlab 的默认是 320×240，够在窗口里看、不够印进讲义 ——
@@ -48,14 +51,27 @@ CHECKPOINT: str | None = None
 PARALLEL_SIZE = (1600, 900)
 KEYFRAME_SIZE = (960, 720)
 
-# 相机距离。默认 5 米对一只 25 厘米高的鸭子来说：单只太小、一群又装不下。
-PARALLEL_DISTANCE = 3.0
-KEYFRAME_DISTANCE = 0.9
+# 相机的量，实测比出来的。三个量一起调才有用：默认视线几乎水平，
+# 地平线落在画面中间、上面三四成是纯黑的天；而 lookat 钉在地面原点，
+# 鸭子沉在画面下缘。
+#   单只：0.8 米 / 俯 15 度，视线抬到躯干高度，关节和脚都看得清。
+#   一群：**只渲 6 只，而且把它们摆得挨近**。
+#        踩过两次坑才对：32 只那版每只都是小点；改成 6 只之后仍然小 ——
+#        因为我退相机去"装下"它们，而任务默认的环境间距本来就有十几米宽。
+#        正确的杠杆是**改间距**，不是退相机：每个环境是独立的物理世界，
+#        间距只影响画面偏移与地形分片查询，平地上纯属视觉安排。
+PARALLEL_SPACING = 0.8
+PARALLEL_ELEVATION = -15.0
+KEYFRAME_DISTANCE = 0.8
+KEYFRAME_ELEVATION = -15.0
+KEYFRAME_LOOKAT = (0.0, 0.0, 0.18)
 
-# 并行仿真图：开多少个环境、让 viewer 额外画进来多少个。
-# 32 个左右在一屏里既看得清单只鸭子、又有"一群"的观感；开太多会糊成一片。
-PARALLEL_ENVS = 32
-PARALLEL_WARMUP_STEPS = 150  # 先跑一会儿，让姿态散开，别都停在初始站姿
+# 并行仿真图开多少个环境（全都画进画面）。
+# 六只：既表达了"不止一只、各自在学"，每只又还看得清在做什么。
+PARALLEL_ENVS = 6
+# 先跑一会儿让姿态散开，别都停在初始站姿；但也别跑太久 ——
+# 它们会各自走开，队形散了就框不住了。
+PARALLEL_WARMUP_STEPS = 90
 
 # 关键帧序列：横排几帧、总共跑多少步、从第几步开始取。
 KEYFRAME_COUNT = 5
@@ -74,6 +90,54 @@ COVER_LAYOUT = (
 )
 COVER_COLUMNS = 2
 # ==============================================================
+
+
+def latest_checkpoint() -> str | None:
+    """给出当前 TASK 的 PPO 那一档最新的 checkpoint 路径。
+
+    自动取而不是写死一个迭代号：训练还在跑的时候，"最新" 每二十分钟就换一个，
+    写死的号码只会让人每次手改一遍、并且早晚忘记改。
+
+    Returns:
+        最新 checkpoint 的路径；那一档还没有任何 checkpoint 时返回 None。
+    """
+    if CHECKPOINT:
+        return CHECKPOINT
+    root = os.environ.get("RL_DUCK_CKPT_ROOT")
+    base = Path(root) if root else Path(os.environ["DATASETS_ROOT"]) / "models" / "trained" / "rl_duck"
+    run_dir = base / f"{task_slug()}-ppo"
+    found = sorted(run_dir.glob("model_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
+    return str(found[-1]) if found else None
+
+
+def parallel_camera(num_envs: int) -> tuple[float, tuple[float, float, float]]:
+    """按这批环境实际铺开的范围，算出相机该放多远、看向哪。
+
+    先空建一次环境（不带渲染器，便宜）把真实的环境原点读出来，再取中心与跨度 ——
+    而不是按环境间距猜数。猜的数在 `PARALLEL_ENVS` 一改就悄悄偏掉：镜头照样出图、
+    脚本照样退 0，只是鸭子跑到画面角上或者小成一排点。
+
+    Args:
+        num_envs: 这张图要开多少个环境。
+
+    Returns:
+        (相机距离, 视线目标)。视线的 z 抬到鸭子躯干高度，不钉在地面。
+    """
+    probe = DuckEnv(num_envs=num_envs, device="cuda:0", seed=0, render_mode=None,
+                    env_spacing=PARALLEL_SPACING)
+    try:
+        origins = probe.unwrapped.scene.env_origins[:num_envs].float()
+        center = origins.mean(dim=0).tolist()
+        span = float((origins.max(dim=0).values - origins.min(dim=0).values)[:2].max())
+    finally:
+        probe.close()
+    # 间距已经压小了，这里只需给一点余量：跨度 + 1.3 米。
+    # 竖直视角约 45 度，2.5 米处画面高约 2 米、宽约 3.6 米，这个跨度装得下还有边。
+    distance = span * 0.8 + 1.0
+    lookat = (float(center[0]), float(center[1]), 0.22)
+    print(f"一群那张图：{num_envs} 只，间距 {PARALLEL_SPACING} 米、实际铺开 {span:.2f} 米"
+          f" => 相机 {distance:.2f} 米，看向 {lookat}")
+    return distance, lookat
 
 
 def result_dir(slug: str | None = None) -> Path:
@@ -127,7 +191,7 @@ def _as_uint8(frame) -> np.ndarray:
     return frame
 
 
-def render_parallel(checkpoint: str | None = CHECKPOINT) -> Path:
+def render_parallel(checkpoint: str | None = None) -> Path:
     """渲一张「一屏一群小鸭子」的并行仿真图。
 
     Args:
@@ -136,14 +200,18 @@ def render_parallel(checkpoint: str | None = CHECKPOINT) -> Path:
     Returns:
         写出的 PNG 路径。
     """
+    distance, lookat = parallel_camera(PARALLEL_ENVS)
     env = DuckEnv(
         num_envs=PARALLEL_ENVS,
         device="cuda:0",
         seed=0,
         render_mode="rgb_array",
         max_extra_envs=PARALLEL_ENVS - 1,
+        env_spacing=PARALLEL_SPACING,
         render_size=PARALLEL_SIZE,
-        camera_distance=PARALLEL_DISTANCE,
+        camera_distance=distance,
+        camera_elevation=PARALLEL_ELEVATION,
+        camera_lookat=lookat,
     )
     frames: list[np.ndarray] = []
     try:
@@ -171,7 +239,7 @@ def render_parallel(checkpoint: str | None = CHECKPOINT) -> Path:
     return out
 
 
-def render_keyframes(checkpoint: str | None = CHECKPOINT) -> Path:
+def render_keyframes(checkpoint: str | None = None) -> Path:
     """渲一条横排的关键帧序列，读者一眼看出这个动作做了什么。
 
     帧是从一段确定性 rollout 里**等间隔**取的，不是挑好看的那几帧 ——
@@ -190,6 +258,8 @@ def render_keyframes(checkpoint: str | None = CHECKPOINT) -> Path:
         render_mode="rgb_array",
         render_size=KEYFRAME_SIZE,
         camera_distance=KEYFRAME_DISTANCE,
+        camera_elevation=KEYFRAME_ELEVATION,
+        camera_lookat=KEYFRAME_LOOKAT,
     )
     frames: list[np.ndarray] = []
     try:
@@ -270,9 +340,10 @@ def build_cover() -> Path | None:
 
 def main():
     """当前 `TASK` 的并行仿真图 + 关键帧序列，然后重拼一次开篇图。"""
-    print(f"TASK = {TASK}，权重 = {CHECKPOINT or '（随机初始化，仅验证版面）'}")
-    render_parallel()
-    render_keyframes()
+    ckpt = latest_checkpoint()
+    print(f"TASK = {TASK}，权重 = {ckpt or '（一个 checkpoint 都没有，用随机初始化，仅验证版面）'}")
+    render_parallel(ckpt)
+    render_keyframes(ckpt)
     build_cover()
 
 
