@@ -1,0 +1,49 @@
+# RL_duck 的唯一环境根。
+#
+# 这个仓故意与 handbook 那九讲的环境分开：小鸭子的训练环境钉 mjlab 1.3.0 + torch 2.9.1，
+# 九讲那套钉 mjlab >=1.4,<1.5 + torch 2.8.0，装不进同一个环境。独立仓 + 独立环境让这件事
+# 变成非问题，也不用去动已经验证过的九讲。
+#
+# 装法（在本目录）：
+#   uv sync
+# 跑法：
+#   uv run python code/train_v1_reinforce.py
+[project]
+name = "rl-duck"
+version = "0.1.0"
+description = "小鸭子强化学习入门：REINFORCE → A2C → PPO，一套算法换几个动作"
+# <3.13：上游 microduck_rl 经 bam 钉了 requires-python <3.13，跟着它走。
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    # 环境的全部来源：机器人模型、任务配置、BAM 执行器、域随机化。
+    # 我们只消费它注册的那些任务，训练器是自己的（见 code/）。
+    "mjlab-microduck",
+    # 我们的训练器：Dataset -> DataModule -> LightningModule -> trainer.fit
+    "lightning",
+    "wandb",
+    "matplotlib",
+    "numpy",
+    # rollout 录像与关键帧序列（与 handbook 的 rollout.py 用同一个库，代码才好逐字复用）
+    "mediapy",
+]
+
+[tool.uv]
+package = false
+# 这三条抄自上游 microduck_rl 的 pyproject —— uv 只认「工作区根」的 override 与 source，
+# 上游作为依赖时它自己那份被忽略，所以必须在这里重述一遍，否则 uv sync 直接解析失败。
+override-dependencies = [
+    # bam 钉 protobuf<4.0（给它的 zmq/dynamixel 消息用，我们不用），
+    # 不放开会连锁把 onnx 压到 1.17.0 —— 那个版本没有 wheel，要从源码编。
+    "protobuf>=4.0,<7.0",
+    "onnx>=1.20.1",
+    # bam 依赖 PyPI 上的占位包 zmq==0.0.0，它的 wheel 是坏的（缺 .dist-info），
+    # 干净环境上 uv sync 会直接失败。我们只用 bam.mjlab，用一个永假的 marker 把它丢掉。
+    "zmq ; python_version < '3.0'",
+]
+
+[tool.uv.sources]
+# 钉具体 commit，不用 branch —— 上游在动，branch 会让「同一份代码」在不同时间装出不同东西。
+mjlab-microduck = { git = "https://github.com/pollen-robotics/microduck_rl", rev = "5946fd9cdbc58956424420153e51975af3b30d77" }
+# BAM 执行器模型的分发名是 better-actuator-models，import 名是 bam。
+# PyPI 上没有能用的版本，必须从这个分支装。
+better-actuator-models = { git = "https://github.com/Rhoban/bam.git", branch = "mjlab_frictionloss" }

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+wandb/
+# 权重落 NAS（RL_DUCK_CKPT_ROOT），不进 git；万一有人在仓里生成也拦住。
+*.pt
+*.onnx
+# result/ 里的曲线、关键帧、json 是要提交的证据；只挡体积大的原始视频。
+result/**/*.mp4
+.uv-cache/
