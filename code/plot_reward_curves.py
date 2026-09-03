@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import NUM_ENVS, task_slug
+from env import NUM_ENVS, result_base, task_slug
 
 # 三个版本在图上的固定顺序与颜色。顺序就是讲义里的演进顺序，别按字母排。
 ALGOS = (
@@ -178,7 +178,10 @@ def main():
         os.environ.get("RL_DUCK_CKPT_ROOT")
         or Path(os.environ["DATASETS_ROOT"]) / "models" / "trained" / "rl_duck"
     )
-    out_dir = Path(__file__).resolve().parents[1] / "result" / slug
+    # 落点与其它出图脚本共用一处（`env.result_base()`，认 RL_DUCK_RESULT_ROOT）。
+    # 先前这里写死了仓内 result/：给了环境变量之后，曲线写进仓内、
+    # 而收件的 collect_delivery 去仓外找，于是报"三张图缺失"。
+    out_dir = result_base() / slug
     out_dir.mkdir(parents=True, exist_ok=True)
 
     series = {}
@@ -245,7 +248,7 @@ def main():
         ax.plot(env_steps, smooth(rewards), color=color, linewidth=1.8)
         ax.set_xlabel("环境步数")
         ax.set_ylabel("每步平均奖励")
-        # 同上，不烧标题 —— 单档曲线是哪一档，正文的图题里写着。
+        # 不烧标题：单档曲线是哪一档，正文的图题里写着。
         ax.grid(alpha=0.25, linewidth=0.5)
         fig.tight_layout()
         single = out_dir / f"reward-{algo}.png"

@@ -5,9 +5,10 @@
 
 ```
 交付/
-├── 讲义/  强化学习入门_小鸭子版.pdf   48 页
+├── 讲义/  强化学习入门_小鸭子版.pdf   49 页
 ├── 视频/  十三段 mp4
-└── 图/    十二张 png（正文引用的就是这些）
+├── 图/    十二张 png（正文引用的就是这些）
+└── 权重/  七份最终权重 + MANIFEST.json（见 权重/README.md）
 ```
 
 **视频不进 git**（二十多兆，按本仓大文件规矩），文件就在 `交付/视频/`；
@@ -31,9 +32,12 @@
 | `单只-取物.mp4` | `六只-取物.mp4` | groundpick-flat · 2000 | 低头把嘴尖压到地面那个点，再起身 |
 | `单只-前滚翻.mp4` | `六只-前滚翻.mp4` | roulade-flat · 6000 | 开头一秒多翻过去，之后一直站着 |
 
-`进化-走路-六档迭代.mp4`：随机策略 → 200 → 1400 → 2600 → 3600 → 4800 → 6000 迭代，
-每档三秒接成一段，左上角标着训练了多少次。曲线只能说"分数在涨"，
-这一段能看见分数涨了长什么样。
+`进化-走路-八档迭代.mp4`：随机策略 → 10 → 90 → 170 → 240 → 320 → 400 → 6000 迭代，
+每档三秒接成一段共 24 秒，左上角标着训练了多少次。
+前七档来自一次**只训 400 迭代、每 10 迭代存一档**的短训练 —— 正式训练每 200 迭代才存一档，
+而"学会站、学会迈第一步"全发生在第 200 之前，那一段没有权重可用。
+末档接的是正式训练的 6000 迭代。
+机位是世界固定的：跟拍会把位移藏起来，而这一段要看的就是"越练越稳"。
 
 **轮滑那段为什么用固定机位**：其余各段是跟拍。轮滑实测 5 秒走 1.553 米，
 但跟拍时镜头锁死在鸭子身上、地板又是无特征的格子，看着像原地踏步。
@@ -51,8 +55,16 @@
 ## 怎么重出
 
 ```sh
-# 图与视频（过程产物落在仓外，交付件由 collect_delivery 按声明取）
-RL_DUCK_RESULT_ROOT=<过程产物根> uv run python code/render_gallery.py
+# ① 七个动作的图与视频：一个动作一行的配方在 code/render_delivery.py 的 JOBS 表里
+RL_DUCK_CKPT_ROOT=交付/权重 RL_DUCK_RESULT_ROOT=<过程产物根> \
+  uv run python code/render_delivery.py            # 不给动作名就全做
+# ② 三条学习曲线
+RL_DUCK_CKPT_ROOT=<训练权重根> RL_DUCK_RESULT_ROOT=<过程产物根> \
+  uv run python code/plot_reward_curves.py
+# ③ 进化视频
+RL_DUCK_EVO_RUN=velocity-flat-ppo RL_DUCK_EVO_FINAL=<6000 迭代那份> \
+  uv run python code/render_evolution.py
+# ④ 按清单收件（缺一件就退非零）
 RL_DUCK_RESULT_ROOT=<过程产物根> uv run python code/collect_delivery.py
 # PDF：编译机是 w4（w1 崩过一次、容器重建之后 quarto 与 xelatex 都没了）
 paper_writing/EAI-wri-025-lecture14-microduck/render-duck-pdf.sh

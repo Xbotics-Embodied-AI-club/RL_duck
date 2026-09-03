@@ -2,9 +2,10 @@
 
 一只 800 克、25 厘米高的双足小鸭子，14 个舵机、50 赫兹控制环。这个仓用它讲一条完整的
 入门链：**REINFORCE → A2C → PPO**，三个算法在同一个任务上跑给你看；然后同一套 PPO
-一行不改，换几个奖励，让它学会滑轮滑、原地旋转、摔倒起身、把球踢出去。
+一行不改，换几个奖励，让它学会滑轮滑、原地旋转、用嘴尖取物、向前翻一个跟头。
 
-讲义在 `docs/`，代码在 `code/`，我们自己跑出来的曲线与关键帧在 `result/`。
+讲义在 `docs/`，代码在 `code/`，交付件（讲义 PDF · 图 · 视频 · 权重）在 `交付/`。
+出图与录像的过程产物落在 `RL_DUCK_RESULT_ROOT` 指的目录（默认仓内 `result/`）。
 
 ## 三条命令
 
@@ -29,6 +30,8 @@ _DEFAULT_NUM_ENVS = 4096                          # 并行环境数；实测甜�
 可选任务用 `uv run python code/env.py` 打印（上游注册了 33 个：13 个平地主任务，
 外加碎石地与带齿隙的孪生版）。
 结果目录与权重目录都从 `TASK` 派生，所以换任务不会覆盖上一个任务的产物。
+**同一个任务的多次训练要靠文件名区分** —— 三个算法都训 velocity-flat，
+所以关键帧、并行图、候选定格的文件名里都带训练名与取样密度（见 `run_label()`）。
 
 ## 目录
 
@@ -42,7 +45,9 @@ _DEFAULT_NUM_ENVS = 4096                          # 并行环境数；实测甜�
 | `code/rollout.py` | 统一口径评测（确定性动作、16 环境 × 400 步）+ 录像 |
 | `code/render_gallery.py` | 并行仿真图、单动作关键帧序列、开篇拼图 |
 | `code/plot_reward_curves.py` | 三级阶梯的对照曲线 |
-| `result/<task-slug>/` | 每个任务的 json / 曲线 / 关键帧 |
+| `<RL_DUCK_RESULT_ROOT>/<task-slug>/` | 每个任务的 json / 曲线 / 关键帧 |
+| `code/render_delivery.py` | 交付件的重出入口：一个动作一行，写清权重与机位 |
+| `code/collect_delivery.py` | 交付清单：声明交付件是什么，按声明收件 |
 
 三份训练脚本都是同一个 Lightning 结构：在线采样的 `IterableDataset` →
 `LightningDataModule` → 算 loss 的 `LightningModule` → `trainer.fit(model, data)`。

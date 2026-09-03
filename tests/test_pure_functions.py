@@ -149,23 +149,32 @@ def test_smooth_preserves_length():
 
 
 def test_trained_keyframes_sorts_numerically_and_drops_untrained(tmp_path):
-    """按迭代号数值排序，并且排除随机策略那版。
+    """按迭代号数值排序，排除随机策略那版，并且只认带训练名的文件名。
 
-    这两条是同一个真事故的两半：字典序下 `untrained` > `iter6000`（`u` > `i`）、
+    前两条是同一个真事故的两半：字典序下 `untrained` > `iter6000`（`u` > `i`）、
     `iter400` > `iter2000`（`4` > `2`）。已提交的开篇拼图里，走路那格取到的
-    就是 `keyframes-untrained.png`，而图标题写着「这里没有一个动作是人教的」。
+    就是随机策略那张，而图标题写着「这里没有一个动作是人教的」。
+
+    第三条是另一个事故：文件名里**不带训练名**时，三个算法都写
+    `keyframes-iter6000.png` —— 后渲的盖掉先渲的，而两张图都存在、尺寸也正常。
+    所以现在的名字是 `keyframes-<训练名>-iter<迭代>-<帧数>f<列数>c.png`，
+    对不上这个式子的一律不认。
     """
-    for name in ("keyframes-iter400.png", "keyframes-iter2000.png",
-                 "keyframes-iter6000.png", "keyframes-untrained.png"):
+    for name in ("keyframes-velocity-flat-ppo-iter400-6f3c.png",
+                 "keyframes-velocity-flat-ppo-iter2000-6f3c.png",
+                 "keyframes-velocity-flat-ppo-iter6000-6f3c.png",
+                 "keyframes-velocity-flat-ppo-untrained-6f3c.png",
+                 "keyframes-iter6000.png"):                 # 旧式命名：不认
         (tmp_path / name).touch()
     got = [p.name for p in _trained_keyframes(tmp_path)]
-    assert got == ["keyframes-iter400.png", "keyframes-iter2000.png", "keyframes-iter6000.png"]
-    assert got[-1] == "keyframes-iter6000.png"      # "最新" 取的是这个
+    assert got == ["keyframes-velocity-flat-ppo-iter400-6f3c.png",
+                   "keyframes-velocity-flat-ppo-iter2000-6f3c.png",
+                   "keyframes-velocity-flat-ppo-iter6000-6f3c.png"]
 
 
 def test_trained_keyframes_only_untrained_gives_nothing(tmp_path):
     """只有随机策略那版时返回空 —— 拼图应当缺一格，而不是摆一只没学过的鸭子。"""
-    (tmp_path / "keyframes-untrained.png").touch()
+    (tmp_path / "keyframes-velocity-flat-ppo-untrained-6f3c.png").touch()
     assert _trained_keyframes(tmp_path) == []
 
 

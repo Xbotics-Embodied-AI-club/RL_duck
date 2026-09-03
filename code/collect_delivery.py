@@ -26,17 +26,17 @@ DELIVERY = REPO / "交付"
 # **正文里的图引用只认右边这一列** —— 换了权重档就改这里，正文一个字都不用动。
 FIGURES: tuple[tuple[str, str], ...] = (
     ("cover.png", "00-开篇动作带.png"),
-    ("velocity-flat/parallel-iter6000.png", "01-并行训练一屏.png"),
+    ("velocity-flat/parallel-velocity-flat-ppo-iter6000.png", "01-并行训练一屏.png"),
     ("velocity-flat/reward-reinforce.png", "02-v1-学习曲线.png"),
-    ("velocity-flat/keyframes-v1-reinforce.png", "03-v1-一整个回合.png"),
+    ("velocity-flat/keyframes-velocity-flat-reinforce-iter6000-12f3c.png", "03-v1-一整个回合.png"),
     ("velocity-flat/reward-a2c.png", "04-v2-学习曲线.png"),
-    ("velocity-flat/keyframes-v2-a2c.png", "05-v2-一整个回合.png"),
+    ("velocity-flat/keyframes-velocity-flat-a2c-iter6000-12f3c.png", "05-v2-一整个回合.png"),
     ("velocity-flat/ladder-reward.png", "06-三档学习曲线.png"),
-    ("velocity-flat/keyframes-iter6000.png", "07-v3-走路.png"),
-    ("velocity-flat-rollers/parallel-iter2000.png", "08-轮滑.png"),
-    ("spin-flat/parallel-iter2000.png", "09-旋转.png"),
-    ("groundpick-flat/keyframes-iter2000.png", "10-取物.png"),
-    ("roulade-flat/keyframes-iter6000.png", "11-前滚翻.png"),
+    ("velocity-flat/keyframes-velocity-flat-ppo-iter6000-6f3c.png", "07-v3-走路.png"),
+    ("velocity-flat-rollers/parallel-velocity-flat-rollers-ppo-iter2000.png", "08-轮滑.png"),
+    ("spin-flat/parallel-spin-flat-ppo-iter2000.png", "09-旋转.png"),
+    ("groundpick-flat/keyframes-groundpick-flat-ppo-iter2000-6f3c.png", "10-取物.png"),
+    ("roulade-flat/keyframes-roulade-flat-ppo-iter6000-12f3c.png", "11-前滚翻.png"),
 )
 
 # 交付视频。每个动作两版：单只看得清姿态，六只看得出这是同一套策略在一群身上跑。
@@ -48,12 +48,12 @@ VIDEOS: tuple[tuple[str, str], ...] = (
     ("spin-flat/交付-旋转.mp4", "单只-旋转.mp4"),
     ("groundpick-flat/交付-取物.mp4", "单只-取物.mp4"),
     ("roulade-flat/交付-前滚翻.mp4", "单只-前滚翻.mp4"),
-    ("velocity-flat/parallel-iter6000.mp4", "六只-走路.mp4"),
-    ("velocity-flat-rollers/parallel-iter2000.mp4", "六只-轮滑.mp4"),
-    ("spin-flat/parallel-iter2000.mp4", "六只-旋转.mp4"),
-    ("groundpick-flat/parallel-iter2000.mp4", "六只-取物.mp4"),
-    ("roulade-flat/parallel-iter6000.mp4", "六只-前滚翻.mp4"),
-    ("velocity-flat/evolution.mp4", "进化-走路-六档迭代.mp4"),
+    ("velocity-flat/parallel-velocity-flat-ppo-iter6000.mp4", "六只-走路.mp4"),
+    ("velocity-flat-rollers/parallel-velocity-flat-rollers-ppo-iter2000.mp4", "六只-轮滑.mp4"),
+    ("spin-flat/parallel-spin-flat-ppo-iter2000.mp4", "六只-旋转.mp4"),
+    ("groundpick-flat/parallel-groundpick-flat-ppo-iter2000.mp4", "六只-取物.mp4"),
+    ("roulade-flat/parallel-roulade-flat-ppo-iter6000.mp4", "六只-前滚翻.mp4"),
+    ("velocity-flat/evolution.mp4", "进化-走路-八档迭代.mp4"),
 )
 
 

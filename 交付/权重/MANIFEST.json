@@ -1,0 +1,93 @@
+[
+  {
+    "run": "groundpick-flat-ppo",
+    "file": "model_2000.pt",
+    "iteration": 2000,
+    "task": null,
+    "obs_dim": 61,
+    "critic_obs_dim": 74,
+    "action_dim": 14,
+    "num_envs": 4096,
+    "num_steps_per_env": 24,
+    "bytes": 4830325,
+    "sha256": "b815786c931497ff"
+  },
+  {
+    "run": "roulade-flat-ppo",
+    "file": "model_6000.pt",
+    "iteration": 6000,
+    "task": "Mjlab-Roulade-Flat-MicroDuck",
+    "obs_dim": 61,
+    "critic_obs_dim": 74,
+    "action_dim": 14,
+    "num_envs": 4096,
+    "num_steps_per_env": 24,
+    "bytes": 4830581,
+    "sha256": "fd0bef3eba6e2eb8"
+  },
+  {
+    "run": "spin-flat-ppo",
+    "file": "model_2000.pt",
+    "iteration": 2000,
+    "task": null,
+    "obs_dim": 61,
+    "critic_obs_dim": 78,
+    "action_dim": 14,
+    "num_envs": 4096,
+    "num_steps_per_env": 24,
+    "bytes": 4854901,
+    "sha256": "9c452b6848738d30"
+  },
+  {
+    "run": "velocity-flat-a2c",
+    "file": "model_6000.pt",
+    "iteration": 6000,
+    "task": null,
+    "obs_dim": 61,
+    "critic_obs_dim": 76,
+    "action_dim": 14,
+    "num_envs": 4096,
+    "num_steps_per_env": 24,
+    "bytes": 4842549,
+    "sha256": "2388491695e3ee56"
+  },
+  {
+    "run": "velocity-flat-ppo",
+    "file": "model_6000.pt",
+    "iteration": 6000,
+    "task": null,
+    "obs_dim": 61,
+    "critic_obs_dim": 76,
+    "action_dim": 14,
+    "num_envs": 4096,
+    "num_steps_per_env": 24,
+    "bytes": 4842613,
+    "sha256": "9d2d56cf17eccdf7"
+  },
+  {
+    "run": "velocity-flat-reinforce",
+    "file": "model_6000.pt",
+    "iteration": 6000,
+    "task": null,
+    "obs_dim": 61,
+    "critic_obs_dim": 76,
+    "action_dim": 14,
+    "num_envs": 4096,
+    "num_steps_per_env": 24,
+    "bytes": 3205621,
+    "sha256": "d5bd629adb2a723e"
+  },
+  {
+    "run": "velocity-flat-rollers-ppo",
+    "file": "model_2000.pt",
+    "iteration": 2000,
+    "task": null,
+    "obs_dim": 61,
+    "critic_obs_dim": 78,
+    "action_dim": 14,
+    "num_envs": 4096,
+    "num_steps_per_env": 24,
+    "bytes": 4854901,
+    "sha256": "7a930e32c9fc3c44"
+  }
+]

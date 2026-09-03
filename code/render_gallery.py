@@ -111,12 +111,13 @@ KEYFRAME_SKIP = 60
 #   · 一个常量管两件事：先前用 KEYFRAME_STEPS 兼作阈值，改绘图长度就会改掉任务分类。
 #   · 用步数当阈值判错了：260 步的阈值把起身的 300 步（6 秒）回合判成"长回合"，
 #     于是那个 0.3 秒就完成的起身动作照旧落在窗口外，五帧仍然逐帧相同。
-# 本任务族的实际分布：走路 20 秒；起身 6 秒、坐站 6 秒、前滚翻 5 秒、取物与踢球同量级。
-# 10 秒落在这两簇中间，两边都留着一倍余量。
+# 本任务族的实际分布：走路 20 秒；起身 6 秒、坐站 6 秒、前滚翻 5 秒。
+# 取物走的是长回合那一支（图上首帧是第 60 步 —— 只有长回合分支才跳前 60 步），
+# 所以它的回合 > 10 秒，与走路同簇。10 秒落在两簇中间，两边都留着一倍余量。
 EPISODIC_THRESHOLD_SECONDS = 10.0
 
 # 开篇拼图：按这个顺序摆格子。每个元素是一个 task slug，
-# 对应 `result/<slug>/keyframes.png` 必须已经渲好。缺哪个就跳过哪个。
+# 对应那个任务的 `cover-cand-*.png` 必须已经渲好（`render_cover_tile` 出的）。。
 #
 # **这张表只放看图确认学成了的动作。** 讲义开篇是"先给结果"，摆一个其实没学成的
 # 动作进去，等于开篇就在骗人。
@@ -322,6 +323,35 @@ def keyframe_window(env: DuckEnv) -> tuple[int, int]:
     return KEYFRAME_SKIP, KEYFRAME_STEPS
 
 
+def run_label(checkpoint: str | None) -> str:
+    """这份权重属于哪一次训练 —— 用来写进文件名。
+
+    **文件名必须能区分算法。** 三个算法都训 velocity-flat，权重都叫 `model_6000.pt`，
+    先前渲出来的图也都叫 `keyframes-iter6000.png` —— 三档写同一个路径，
+    后渲的盖掉先渲的，而两张图都存在、尺寸也都正常，看不出被盖过。
+    实测代价：交付图里 v1 那张与 v3 那张 md5 相同。
+
+    Args:
+        checkpoint: 权重路径；None 表示随机策略。
+
+    Returns:
+        训练名（权重所在目录名，如 `velocity-flat-ppo`），随机策略给 `untrained`。
+
+    Raises:
+        RuntimeError: 给了权重却读不出所属训练 —— 那说明权重不在 `<run>/model_N.pt`
+            这个布局里，此时**不猜**，因为猜错会把两档的图混成一档。
+    """
+    if not checkpoint:
+        return "untrained"
+    run = Path(checkpoint).parent.name
+    if not run or run.startswith("model"):
+        raise RuntimeError(
+            f"从权重路径读不出所属训练：{checkpoint!r}。"
+            "期望布局 <run>/model_<迭代>.pt —— 目录名就是训练名。"
+        )
+    return run
+
+
 def make_policy(env: DuckEnv, checkpoint: str | None):
     """给出一个能出动作的策略：有权重就加载，没有就随机初始化。
 
@@ -337,7 +367,7 @@ def make_policy(env: DuckEnv, checkpoint: str | None):
     if checkpoint:
         model, iteration, settings = load_policy(checkpoint, env.device)
         # 与 rollout 同一口径，两件事都要：
-        # ① 核对这份权重是不是当前任务训的 —— 十八个任务的观测/动作维度全相同，
+        # ① 核对这份权重是不是当前任务训的 —— 三十三个任务的观测与动作维度大量重合，
         #    错配不会报形状错，只会渲出一段"这个动作没学会"的画面并覆盖真结果。
         #    批量出图时一台机器七个进程各带一份 TASK 与 CHECKPOINT，错配一次就说不清了。
         # ② 把课程表对齐到这份权重训练到的那一档，否则渲的是「第 0 档课程下的初始姿态」，
@@ -431,11 +461,11 @@ def render_parallel(checkpoint: str | None = None) -> Path:
 
     if not frames:
         raise RuntimeError("render() 一帧都没回 —— 检查 render_mode 与 viewer 配置")
-    out = result_dir() / f"parallel-{tag}.png"
+    out = result_dir() / f"parallel-{run_label(checkpoint)}-{tag}.png"
     # 静帧取**第一帧**而不是最后一帧：预热之后步态已经起来、六只还都在画面里；
     # 到最后一帧它们已经各自走开，那张图只剩一半。
     plt.imsave(out, frames[0])
-    video = result_dir() / f"parallel-{tag}.mp4"
+    video = result_dir() / f"parallel-{run_label(checkpoint)}-{tag}.mp4"
     media.write_video(str(video), frames, fps=fps)
     h, w = frames[0].shape[:2]
     print(f"写出 {out} 与 {video}  ({w}×{h}，{PARALLEL_ENVS} 个环境，{len(frames)} 帧)")
@@ -537,7 +567,8 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
     # imshow 保持等比、图在格子里居中 ⇒ 富余的高度一半跑到图上方去了，
     # 表现为行与行之间一条空带。hspace 收掉它。
     fig.subplots_adjust(hspace=0.02)
-    out = result_dir() / f"keyframes-{tag}.png"
+    # 名字里带训练名与取样密度：三个算法、6 帧版与 12 帧版都不再互相覆盖。
+    out = result_dir() / f"keyframes-{run_label(checkpoint)}-{tag}-{KEYFRAME_COUNT}f{KEYFRAME_COLS}c.png"
     fig.savefig(out)
     plt.close(fig)
     print(f"写出 {out}  (取了 {KEYFRAME_COUNT} 帧，共 {len(usable)} 帧可选)")
@@ -567,8 +598,8 @@ def _trained_keyframes(task_dir: Path) -> list[Path]:
     if not task_dir.is_dir():
         return []
     numbered = []
-    for p in task_dir.glob("keyframes-iter*.png"):
-        m = re.fullmatch(r"keyframes-iter(\d+)", p.stem)
+    for p in task_dir.glob("keyframes-*-iter*.png"):
+        m = re.fullmatch(r"keyframes-.+-iter(\d+)-\d+f\d+c", p.stem)
         if m:
             numbered.append((int(m.group(1)), p))
     return [p for _n, p in sorted(numbered)]
@@ -702,8 +733,8 @@ def _latest_parallel(task_dir: Path) -> Path | None:
     if not task_dir.is_dir():
         return None
     numbered = []
-    for p in task_dir.glob("parallel-iter*.png"):
-        m = re.fullmatch(r"parallel-iter(\d+)", p.stem)
+    for p in task_dir.glob("parallel-*-iter*.png"):
+        m = re.fullmatch(r"parallel-.+-iter(\d+)", p.stem)
         if m:
             numbered.append((int(m.group(1)), p))
     return max(numbered)[1] if numbered else None
@@ -766,10 +797,10 @@ def render_cover_tile(checkpoint: str | None = None) -> Path:
     out = None
     for frac in _COVER_TILE_FRACS:
         pick = usable[min(int(len(usable) * frac), len(usable) - 1)]
-        cand = result_dir() / f"cover-cand-{tag}-{int(frac * 100):02d}.png"
+        cand = result_dir() / f"cover-cand-{run_label(checkpoint)}-{tag}-{int(frac * 100):02d}.png"
         media.write_image(cand, crop_to_content(pick, margin_frac=0.10, aspect=4 / 3))
         out = out or cand
-    print(f"写出 {len(_COVER_TILE_FRACS)} 张候选到 {result_dir()}/cover-cand-{tag}-*.png"
+    print(f"写出 {len(_COVER_TILE_FRACS)} 张候选到 {result_dir()}/cover-cand-{run_label(checkpoint)}-{tag}-*.png"
           f" —— build_cover 会按相位编号取前 {COVER_COLUMNS} 张排成一行")
     return out
 
@@ -793,7 +824,7 @@ def build_cover() -> Path | None:
     Raises:
         RuntimeError: `XBOTICS_FIG_FONT` 取不到 —— 回落系统字体会静默换掉字形。
     """
-    root = Path(__file__).resolve().parents[1] / "result"
+    root = result_base()
     font_path = os.environ.get("XBOTICS_FIG_FONT", "")
     if not font_path or not Path(font_path).is_file():
         raise RuntimeError(f"出图字体取不到（西文 Times New Roman + 中文宋体）：{font_path!r}")
@@ -810,9 +841,14 @@ def build_cover() -> Path | None:
             continue
         rows.append((label, cand[:COVER_COLUMNS]))
         print(f"动作带取 {label}（{slug}）: {' '.join(q.name for q in cand[:COVER_COLUMNS])}")
-    if not rows:
-        print("一行都凑不出来，先渲各动作的单只定格。")
-        return None
+    if len(rows) < len(COVER_LAYOUT):
+        missing = [label for slug, label in COVER_LAYOUT
+                   if label not in {r[0] for r in rows}]
+        raise RuntimeError(
+            f"动作带凑不齐：缺 {'、'.join(missing)}。"
+            "先把这些任务的单只定格渲出来（render_cover_tile）再拼 —— "
+            "静默少一行会得到一张看不出缺了什么的图。"
+        )
 
     tw, th = _COVER_TILE_PX
     gut = _COVER_GUTTER_PX
@@ -829,18 +865,34 @@ def build_cover() -> Path | None:
         for c, q in enumerate(paths):
             sheet.paste(Image.open(q).convert("RGB").resize((tw, th), Image.LANCZOS),
                         (_COVER_LABEL_PX + c * tw, y))
-    out = root / "cover.png"
+    out = result_base() / "cover.png"
     sheet.save(out)
     print(f"写出 {out}  ({len(rows)} 行 × {COVER_COLUMNS} 张)")
     return out
 
 def main():
-    """当前 `TASK` 的并行仿真图 + 关键帧序列，然后重拼一次开篇图。"""
+    """当前 `TASK` 的四类图各出一份，最后重拼一次开篇动作带。
+
+    四类都在这里，因为**没有入口的产物等于产不出来**：`render_cover_tile`
+    先前全仓零调用点，于是开篇那条动作带只能靠人手敲一段临时脚本才出得来 ——
+    交付清单里声明了它，重出配方里却没有它。
+    """
     ckpt = latest_checkpoint()
     print(f"TASK = {TASK}，权重 = {ckpt or '（一个 checkpoint 都没有，用随机初始化，仅验证版面）'}")
-    render_parallel(ckpt)
-    render_keyframes(ckpt)
-    build_cover()
+    # `RL_DUCK_ONLY` 挑其中几类做（逗号分隔）。批量出图时一个动作只要某一类，
+    # 全做一遍要多花几分钟渲不用的东西。
+    only = {x.strip() for x in (os.environ.get("RL_DUCK_ONLY") or "").split(",") if x.strip()}
+    steps = (("parallel", lambda: render_parallel(ckpt)),
+             ("keyframes", lambda: render_keyframes(ckpt)),
+             ("tile", lambda: render_cover_tile(ckpt)),
+             ("cover", build_cover))
+    unknown = only - {name for name, _fn in steps}
+    if unknown:
+        raise SystemExit(f"★ RL_DUCK_ONLY 里有认不出的项：{sorted(unknown)}；"
+                         f"可选 {[name for name, _fn in steps]}")
+    for name, fn in steps:
+        if not only or name in only:
+            fn()
 
 
 if __name__ == "__main__":

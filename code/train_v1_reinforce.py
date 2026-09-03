@@ -60,7 +60,7 @@ def save_checkpoint(path, model, optimizer, iteration, training_settings):
         model: 要保存的 `ActorCritic`。
         optimizer: 当前优化器。
         iteration: 当前是第几次迭代。
-        training_settings: 本次训练的全部设置，一并写进文件。
+        training_settings: 上面列出的那些设置，一并写进文件（不含优化侧超参）。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -331,7 +331,7 @@ def run_training(run_name, num_envs, max_iterations, num_steps_per_env, save_int
         "seed": seed, "checkpoint_dir": str(checkpoint_dir), "wandb_project": wandb_project,
         "wandb_mode": wandb_mode, "gamma": gamma,
         "obs_dim": env.obs_dim, "critic_obs_dim": env.critic_obs_dim, "action_dim": env.action_dim,
-        # 权重是哪个任务训的，必须存下来。十八个任务的观测都是 61 维、动作都是 14 维，
+        # 权重是哪个任务训的，必须存下来。三十三个任务的 actor 观测都是 61 维、动作都是 14 维，
         # 所以拿 A 任务的权重去评 B 任务，**形状检查一个都拦不住** ——
         # 它会安安静静写出一份看着正常的低分，并覆盖掉 B 的真结果。
         "task": env.task,
