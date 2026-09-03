@@ -66,6 +66,40 @@ def load_policy(checkpoint, device):
     return model, int(data.get("iteration", -1)), settings
 
 
+def check_task_match(env, settings, checkpoint) -> None:
+    """确认这份权重就是当前任务训出来的，不是的话当场停下。
+
+    为什么非查不可：注册表里那 33 个任务**共用同一份观测布局**（61 维观测、14 维动作，用不到的
+    指令槽位填零而不是删掉，见讲义 8.9 节）。好处是策略可以随时互换，代价是
+    **跨任务评测在形状上完全合法** —— 拿旋转的权重去评起身，模型加载成功、
+    环境跑得动、分数算得出来，只是那个分毫无意义，而且它会按 run 名覆盖掉起身的真结果。
+    批量出图时一台机器七个进程各带一份 `RL_DUCK_TASK` 与 `RL_DUCK_CHECKPOINT`，
+    错配一次就是一份说不清来源的结果。
+
+    老 checkpoint 里没存 `task`（v1/v2 是后来才补的字段），那种情况只警告不拦：
+    拦下来会让已经跑完的那些档没法评，而它们本来就是对的。
+
+    Args:
+        env: 当前环境。
+        settings: checkpoint 里的 `training_settings`。
+        checkpoint: 权重路径，报错时指名道姓。
+
+    Raises:
+        SystemExit: checkpoint 存了 task 且与当前任务不一致。
+    """
+    trained_task = settings.get("task")
+    if not trained_task:
+        print(f"⚠ {Path(checkpoint).name} 里没存 task 字段（早于该字段的老权重）——"
+              f" 无法核对它是不是 {env.task} 训的，自己确认")
+        return
+    if trained_task != env.task:
+        raise SystemExit(
+            f"任务对不上：{Path(checkpoint).name} 是 {trained_task} 训的，"
+            f"当前环境是 {env.task}。两者观测/动作维度相同，所以不会报形状错 —— "
+            "但评出来的分没有意义，而且会覆盖当前任务的真结果。"
+        )
+
+
 def align_curriculum(env, iteration, settings) -> int:
     """把环境的课程表对齐到这份权重训练到的那一档，**必须在 reset 之前调**。
 
@@ -150,11 +184,25 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         camera_origin="asset_root",
     )
     rewards, action_abs_means, frames = [], [], []
-    # 逐项奖励：mjlab 把每一项的回合累计放在 extras["log"] 里。总奖励会骗人 ——
-    # 它可能全靠正则项在涨而目标动作从没发生，所以要看**主任务那一项**。
-    # 这些任务都没有定义成功率指标（它们是连续奖励任务，不是成败任务），
-    # 逐项奖励是我们能拿到的最接近「有没有做成那件事」的东西。
-    term_sums: dict[str, float] = {}
+    # mjlab 把两类完全不同的东西混在同一个 extras["log"] 字典里，**刷新时机不一样**：
+    #
+    #   · `Episode_Reward/*` 是**回合累计**，只在回合结束、环境被重置时才刷新一次。
+    #   · `Metrics/*` 与 `Curriculum/*` 是**逐步**更新的。
+    #
+    # 先前这里把整个字典按步数求平均，于是走路那档（回合 1000 步、评测只跑 400 步、
+    # 一次重置都没有）写出来的 16 个 `Episode_Reward/*` **全都恰好是 0.0** ——
+    # 而那时的注释还写着"总奖励会骗人，要看主任务那一项"，把一个恒为零的字段
+    # 推荐成核心判据。已交付的两份 json 里就是这样。
+    #
+    # 现在两类分开数、分母各算各的，并且重置次数为 0 时在摘要里明说
+    # `Episode_Reward/*` 这一半没有意义 —— 一个字段是"真的零"还是"没刷新过"，
+    # 读的人必须能分得出来。
+    #
+    # ⚠️ 判断动作有没有学成不要靠这些数（这批任务都是连续奖励，没有成功率指标）——
+    # 按 bd `xb-haj0`：**看关键帧图判定**。这里的数只用来做同口径的横向对照。
+    episode_sums: dict[str, float] = {}
+    step_sums: dict[str, float] = {}
+    episode_refreshes = 0
     term_count = 0
     # 回合是怎么结束的，两种分开数。`terminated & ~time_outs` 才是"摔了/被判失败"；
     # 光看合并后的 done，短回合任务会把每次超时重置都记成一次摔倒。
@@ -162,8 +210,9 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
     timeout_count = 0
     try:
         model, iteration, settings = load_policy(checkpoint, env.device)
-        # 顺序是硬的：先对齐课程表，再 reset —— 初始姿态的混合是在 reset 那一刻按
-        # 当前档位抽的，reset 之后再改就只能影响下一个回合。
+        # 顺序是硬的：先核对任务、再对齐课程表、最后 reset。
+        # 初始姿态的混合是在 reset 那一刻按当前档位抽的，reset 之后再改只影响下一个回合。
+        check_task_match(env, settings, checkpoint)
         curriculum_step = align_curriculum(env, iteration, settings)
         obs, _critic_obs = env.reset()
         for _ in range(num_steps):
@@ -180,10 +229,16 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
             log = info.get("mjlab_extras", {}).get("log", {})
             if log:
                 term_count += 1
+                # 这一步有环境被重置吗？有才说明 Episode_Reward/* 这一半刚刷新过。
+                reset_here = bool((terminated | time_outs).any())
+                episode_refreshes += int(reset_here)
                 for key, value in log.items():
-                    term_sums[key] = term_sums.get(key, 0.0) + float(
-                        value.mean() if hasattr(value, "mean") else value
-                    )
+                    scalar = float(value.mean() if hasattr(value, "mean") else value)
+                    if key.startswith("Episode_Reward/"):
+                        if reset_here:
+                            episode_sums[key] = episode_sums.get(key, 0.0) + scalar
+                    else:
+                        step_sums[key] = step_sums.get(key, 0.0) + scalar
             action_abs_means.append(float(actions.detach().abs().mean().cpu()))
             frame = env.render()
             if frame is not None:
@@ -214,7 +269,17 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         "timeout_fraction": float(timeout_count / (terminated_count + timeout_count))
         if (terminated_count + timeout_count)
         else 0.0,
-        "reward_terms": {k: v / term_count for k, v in sorted(term_sums.items())} if term_count else {},
+        # 逐步指标：按步数平均，可以直接横向比。
+        "step_metrics": {k: v / term_count for k, v in sorted(step_sums.items())} if term_count else {},
+        # 回合累计奖励分项：只在有环境被重置的那些步上取到，分母是重置步数。
+        # `episode_refreshes == 0` 时这里是空字典，而不是一堆 0.0 ——
+        # "没测到"和"测出来是零"必须长得不一样。
+        "episode_reward_terms": (
+            {k: v / episode_refreshes for k, v in sorted(episode_sums.items())}
+            if episode_refreshes
+            else {}
+        ),
+        "episode_refreshes": episode_refreshes,
     }
     json_output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
@@ -225,23 +290,42 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
 
 
 def main():
-    """依次评测三个版本各自的最终 checkpoint。"""
+    """依次评测三个版本各自最新的 checkpoint。
+
+    三档必须**全部**评到，缺一档就报错退出：这份评测的用途就是三算法同台对照，
+    只评到两档的输出看着完整、实际上是一张缺腿的表。
+
+    Raises:
+        SystemExit: 三档里有任何一档拿不到 checkpoint。
+
+    先前这里按 `model_{MAX_ITERATIONS}.pt` 拼死路径，找不到就打印一行 skip 然后
+    **退 0**。真实后果：REINFORCE 那档当时只到 `model_3000.pt`，于是它从头到尾
+    没有被评过一次，`result/` 里一份 reinforce 的 json 都没有，而讲义里 v1 那几格
+    的数字无处可来 —— 而脚本每次都"成功"。
+    改成取各档实际最新的那个 checkpoint（与 `render_gallery.latest_checkpoint`
+    同一种数值排序），并在缺档时退非零。
+    """
     root = os.environ.get("RL_DUCK_CKPT_ROOT")
     trained = Path(root) if root else Path(os.environ["DATASETS_ROOT"]) / "models" / "trained" / "rl_duck"
 
-    # 对三个版本各跑一遍对照（用各自最终 checkpoint）。
     slug = task_slug()
-    runs = {
-        f"{slug}-{algo}": f"{slug}-{algo}/model_{MAX_ITERATIONS}.pt"
-        for algo in ("reinforce", "a2c", "ppo")
-    }
-    for run_name, rel in runs.items():
-        checkpoint = trained / rel
-        if not checkpoint.exists():
-            print(f"skip {run_name}: {checkpoint} not found")
+    missing = []
+    for algo in ("reinforce", "a2c", "ppo"):
+        run_name = f"{slug}-{algo}"
+        found = sorted((trained / run_name).glob("model_*.pt"),
+                       key=lambda p: int(p.stem.split("_")[1])) if (trained / run_name).is_dir() else []
+        if not found:
+            print(f"★ {run_name}: {trained / run_name} 下没有任何 checkpoint")
+            missing.append(run_name)
             continue
+        checkpoint = found[-1]
+        if int(checkpoint.stem.split("_")[1]) < MAX_ITERATIONS:
+            print(f"⚠ {run_name}: 最新只到 {checkpoint.name}，"
+                  f"不足预定的 {MAX_ITERATIONS} 迭代 —— 三档同台的「同一份预算」这句话对它不成立")
         summary = run_rollout(checkpoint=checkpoint, run_name=run_name, device="cuda:0")
         print(json.dumps(summary, indent=2, sort_keys=True))
+    if missing:
+        raise SystemExit(f"这几档没评到：{missing} —— 三算法对照缺一档就不成立")
 
 
 if __name__ == "__main__":

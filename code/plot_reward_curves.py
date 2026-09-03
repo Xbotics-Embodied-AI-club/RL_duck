@@ -1,8 +1,32 @@
 """把三级阶梯的训练曲线画成一张对照图。
 
-数据从 W&B 的离线运行目录读（训练一律 `WANDB_MODE=offline`，事后 `wandb sync`），
-所以不联网也能出图。横轴用**环境步数**而不是墙钟：墙钟依赖当时跑在哪张卡上、
-有没有别的任务在抢，换台机器数字就变；环境步数是算法本身消耗的经验量，跨机器可比。
+数据读每个 run 目录下的 `metrics.jsonl`（训练时逐迭代追加的那份）。**不读 W&B 的
+离线目录**，理由要说准，因为这里有个容易过度概括的坑：
+
+· **还没 `wandb sync` 的离线 run**，`files/` 里只有 `requirements.txt`，
+  指标全在二进制 `run-*.wandb` 里；`wandb-history.jsonl` 这个文件名**从来不存在**
+  （那是旧版 W&B 的格式）。本脚本先前正是照它去读，于是"一条曲线都没读到"
+  却仍然退 0，看着像"你还没训练"。
+· **`wandb sync` 之后**，同一个目录里会多出 `config.yaml` / `wandb-metadata.json` /
+  `wandb-summary.json`。实测（velocity-flat-ppo 那档 sync 之后）`config.yaml` 里
+  确实有 `num_envs: 4096` 与 `num_steps_per_env: 24` —— **它是一条可用的来源，
+  而且不需要 torch。** 先前这段注释写"config.yaml 一个都不存在"，那句话只对
+  没 sync 的 run 成立，写成通则就是过度概括。
+
+仍然选 checkpoint 而不选 `config.yaml` 的理由：**sync 是收尾动作**，训练刚跑完、
+还没 sync 的时候也要能出图；而 checkpoint 从第一次存盘起就在，且它正是评测那条
+路径已经在读的同一个文件。⇒ 一份数据一个来源，不必为了省一次 torch.load 再引入
+一条"要看是否 sync 过"的分支。
+
+**判据不能建在一个不存在的文件上** —— 这条教训成立，只是原因不是"config.yaml 不存在"，
+而是"`wandb-history.jsonl` 这个名字压根不属于当前版本的 W&B"。
+
+横轴用**环境步数**而不是墙钟：墙钟依赖当时跑在哪张卡上、有没有别的任务在抢，
+换台机器数字就变；环境步数是算法本身消耗的经验量，跨机器可比。换算所需的
+`num_envs` / `num_steps_per_env` 从**该 run 自己的 checkpoint** 里读
+（`save_checkpoint` 把 `training_settings` 一并存了进去），不用当前进程的环境变量 ——
+批量跑时每档的 `RL_DUCK_NUM_ENVS` 可以不同，拿当前值去换算会整倍数地算错，
+而且图照样画得出来、看不出错。
 
 讲义对应：5.6 / 6.5 节（各自的曲线）、7.7 节（三个算法同台）。
 
@@ -18,6 +42,7 @@ from pathlib import Path
 
 import matplotlib
 import numpy as np
+import torch
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -32,7 +57,7 @@ ALGOS = (
     ("a2c", "v2 A2C", "#1f77b4"),
     ("ppo", "v3 PPO", "#d62728"),
 )
-NUM_STEPS_PER_ENV = 24  # 与三份 train 脚本的 main() 一致；一次迭代 = NUM_ENVS × 这个数
+NUM_STEPS_PER_ENV = 24  # 与三份 train 脚本的 main() 一致；读不到 run 自己的设置时的回落值
 
 
 def use_project_font():
@@ -55,63 +80,60 @@ def use_project_font():
     plt.rcParams["axes.unicode_minus"] = False
 
 
-def read_offline_run(run_dir: Path) -> tuple[np.ndarray, np.ndarray]:
-    """从一个 W&B 离线运行目录里读出「迭代 → 平均奖励」序列。
+def read_metrics(run_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    """从 run 目录的 `metrics.jsonl` 里读出「迭代 → 平均奖励」序列。
 
-    离线 run 把每条 log 写成 `wandb-history.jsonl` 的一行，直接按行解析即可，
-    不需要连 W&B 服务。
+    **只保留最后一次运行那一段。** 这个文件是追加写的，同一个 run 名重跑或续训时
+    新的迭代号会从小数字重新开始，于是文件里躺着多段。若把整份按迭代号排序，
+    两段会交错混在一起 —— 画出来是一条上下横跳的锯齿，看着像"训练不稳定"，
+    其实是两次运行被叠在了一起。实测 velocity-flat-reinforce 那份就是
+    3153 行旧段 + 新段，共 5164 行。判据：迭代号不再递增的地方就是重启点。
 
     Args:
-        run_dir: 形如 `.../wandb/offline-run-<时间>-<id>/` 的目录。
+        run_dir: 形如 `<ckpt_root>/<run_name>/` 的目录。
 
     Returns:
-        (迭代序号数组, 平均奖励数组)，按迭代升序。
+        (迭代序号数组, 平均奖励数组)，按迭代升序；文件不存在或没有 reward 时返回空数组。
     """
-    history = run_dir / "files" / "wandb-history.jsonl"
-    if not history.is_file():
-        history = run_dir / "wandb-history.jsonl"
+    path = run_dir / "metrics.jsonl"
+    if not path.is_file():
+        return np.asarray([]), np.asarray([])
     steps, rewards = [], []
-    with history.open(encoding="utf-8") as fh:
+    with path.open(encoding="utf-8") as fh:
         for line in fh:
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if "reward" not in row:
+            if "reward" not in row or "iteration" not in row:
                 continue
-            steps.append(int(row.get("_step", len(steps) + 1)))
+            steps.append(int(row["iteration"]))
             rewards.append(float(row["reward"]))
-    order = np.argsort(steps)
-    return np.asarray(steps)[order], np.asarray(rewards)[order]
+    start = 0
+    for i in range(1, len(steps)):
+        if steps[i] <= steps[i - 1]:
+            start = i
+    return np.asarray(steps[start:]), np.asarray(rewards[start:])
 
 
-def find_run_dir(wandb_root: Path, run_name: str) -> Path | None:
-    """在离线 wandb 目录里找到某个 run 名对应的那个目录。
+def read_run_settings(run_dir: Path) -> dict:
+    """从该 run 自己的 checkpoint 里取出这次训练的设置。
 
-    同一个 run 名可能跑过多次（重跑、续训），取最后修改的那个 —— 也就是最新一次。
+    `save_checkpoint` 把整份 `training_settings` 存进了每个 `model_*.pt`，
+    所以 run 目录是自描述的，不必再存一份侧写文件、也不必信当前进程的环境变量。
+    `weights_only=False` 是必需的：这个字典里除了数字还有 symmetry 配置对象。
 
     Args:
-        wandb_root: 存放 `offline-run-*` 的目录。
-        run_name: 训练时给的 run 名。
+        run_dir: 形如 `<ckpt_root>/<run_name>/` 的目录。
 
     Returns:
-        找到的目录，没找到返回 None。
+        `training_settings` 字典；没有 checkpoint 或里面没存设置时返回空字典。
     """
-    candidates = []
-    for d in sorted(wandb_root.glob("offline-run-*")):
-        meta = d / "files" / "wandb-metadata.json"
-        if not meta.is_file():
-            continue
-        try:
-            if json.loads(meta.read_text(encoding="utf-8")).get("name") == run_name:
-                candidates.append(d)
-        except json.JSONDecodeError:
-            continue
-    if candidates:
-        return max(candidates, key=lambda p: p.stat().st_mtime)
-    # 退一步：按目录名里带的 run 名匹配（metadata 缺失时）
-    named = sorted(wandb_root.glob(f"offline-run-*{run_name}*"))
-    return named[-1] if named else None
+    ckpts = sorted(run_dir.glob("model_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
+    if not ckpts:
+        return {}
+    blob = torch.load(ckpts[-1], map_location="cpu", weights_only=False)
+    return blob.get("training_settings") or {}
 
 
 def smooth(values: np.ndarray, window: int = 21) -> np.ndarray:
@@ -135,7 +157,12 @@ def smooth(values: np.ndarray, window: int = 21) -> np.ndarray:
 
 
 def main():
-    """出两张图：三个算法同台，以及各自单独一张。"""
+    """出两张图：三个算法同台，以及各自单独一张。
+
+    Raises:
+        SystemExit: 三档一条曲线都没读到 —— 这时候不能退 0，否则"图没出来"会被
+            当成"训练还没跑"，而真正的原因（路径不对、文件名对不上）不会有人去查。
+    """
     use_project_font()
     slug = task_slug()
     ckpt_root = Path(
@@ -148,24 +175,41 @@ def main():
     series = {}
     for algo, label, color in ALGOS:
         run_name = f"{slug}-{algo}"
-        wandb_root = ckpt_root / run_name / "wandb"
-        if not wandb_root.is_dir():
-            print(f"跳过 {run_name}：{wandb_root} 不存在（还没训 / 目录不对）")
+        run_dir = ckpt_root / run_name
+        if not run_dir.is_dir():
+            print(f"跳过 {run_name}：{run_dir} 不存在（还没训 / 目录不对）")
             continue
-        run_dir = find_run_dir(wandb_root, run_name)
-        if run_dir is None:
-            print(f"跳过 {run_name}：{wandb_root} 下没找到它的离线 run")
-            continue
-        iters, rewards = read_offline_run(run_dir)
+        iters, rewards = read_metrics(run_dir)
         if iters.size == 0:
-            print(f"跳过 {run_name}：离线 run 里没有 reward 记录")
+            print(f"跳过 {run_name}：{run_dir / 'metrics.jsonl'} 里没有可用记录")
             continue
-        series[algo] = (iters * NUM_ENVS * NUM_STEPS_PER_ENV, rewards, label, color)
-        print(f"{run_name}: {iters.size} 个记录点，最后 reward = {rewards[-1]:.4f}")
+        settings = read_run_settings(run_dir)
+        # 两个因子**分别**判来源。先前只看 num_envs 就打印 "checkpoint"，
+        # 于是步数因子悄悄回落时诊断行仍然说"来自 checkpoint" —— 诊断行本身在说谎。
+        n_envs = settings.get("num_envs") or NUM_ENVS
+        n_steps = settings.get("num_steps_per_env") or NUM_STEPS_PER_ENV
+        src_envs = "ckpt" if settings.get("num_envs") else f"回落{NUM_ENVS}"
+        src_steps = "ckpt" if settings.get("num_steps_per_env") else f"回落{NUM_STEPS_PER_ENV}"
+        if "回落" in src_envs or "回落" in src_steps:
+            # 盘上真有 8192 与 4096 两种 run，横轴因子差两倍。回落只能是"没别的办法"，
+            # 不能是默认路径 —— 所以它必须显眼。
+            print(f"⚠ {run_name}: 换算因子有一项取不到该 run 自己的设置，"
+                  f"横轴可能整倍数偏差（envs={src_envs}, steps={src_steps}）")
+        series[algo] = (iters * n_envs * n_steps, rewards, label, color)
+        print(
+            f"{run_name}: 迭代 {iters[0]}–{iters[-1]}（{iters.size} 点），"
+            f"每迭代 {n_envs}({src_envs})×{n_steps}({src_steps}) 环境步，"
+            f"末段 reward = {rewards[-1]:.4f}"
+        )
 
     if not series:
-        print("一条曲线都没读到，先训练再来出图。")
-        return
+        raise SystemExit(f"三档一条曲线都没读到，检查 {ckpt_root} 下有没有 {slug}-* 的 run 目录")
+
+    # 横轴要可比，前提是三档的「每迭代环境步数」一致；不一致就说出来，别让读者以为同预算。
+    factors = {int(s[0][1] - s[0][0]) if s[0].size > 1 else 0 for s in series.values()}
+    if len(factors) > 1:
+        print(f"⚠ 三档的每迭代环境步数不一致：{sorted(factors)} —— 横轴仍可比，但"
+              f"「同一份预算」这句话在讲义里要改。")
 
     fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=200)
     for algo, _label, _color in ALGOS:

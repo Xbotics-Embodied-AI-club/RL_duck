@@ -26,7 +26,7 @@ from tensordict import TensorDict
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import MAX_ITERATIONS, NUM_ENVS, DuckEnv, task_slug, task_symmetry_cfg
+from env import MAX_ITERATIONS, NUM_ENVS, SEED, TASK, DuckEnv, task_slug, task_symmetry_cfg
 from model import ActorCritic, compute_gae
 
 
@@ -145,6 +145,19 @@ def resolve_mirror_function(symmetry_cfg, obs_dim=None, action_dim=None):
         RuntimeError: 配置说要用镜像损失，但没给镜像函数的路径或没给系数；
             或者镜像函数的契约自检不通过。
     """
+    # 上游那份配置里有**两个**独立开关，本训练器只实现了后者：
+    #   · use_data_augmentation —— 把镜像样本追加进 batch（数据侧，等于把批量翻倍）
+    #   · use_mirror_loss       —— 在 loss 上加一项镜像一致性（算法侧，我们实现的是这个）
+    # 33 个任务里目前全都是 use_data_augmentation=False（前滚翻实测也是 False），
+    # 所以"不实现"暂时没有代价。但**不能默默忽略它**：哪天上游把它打开，
+    # 我们会只做一半的配方，而两个开关都在同一个字典里、日志上看不出差别。
+    # ⇒ 请求了就报错，把"没实现"变成一件响的事。
+    if symmetry_cfg and symmetry_cfg.get("use_data_augmentation"):
+        raise RuntimeError(
+            f"任务 {TASK} 声明了 use_data_augmentation=True，而本训练器只实现了 "
+            "use_mirror_loss（loss 上的镜像一致性项），没有实现数据侧的镜像增广。"
+            "照原样跑等于只执行了一半的配方 —— 要么实现它，要么明确决定不用它。"
+        )
     if not symmetry_cfg or not symmetry_cfg.get("use_mirror_loss"):
         return None, 0.0
     dotted = symmetry_cfg.get("data_augmentation_func")
@@ -169,8 +182,16 @@ def resolve_mirror_function(symmetry_cfg, obs_dim=None, action_dim=None):
 def save_checkpoint(path, model, optimizer, iteration, training_settings):
     """存一份可续训、也可直接拿去评测的权重。
 
-    优化器状态和这次训练的全部设置一起存下来，评测脚本才能凭 checkpoint 自己重建
-    出维度一致的网络，不必再猜环境配置。
+    优化器状态与 `training_settings` 一起存下来，评测脚本才能凭 checkpoint 自己重建
+    出维度一致的网络、并把课程表对齐到同一档，不必再猜环境配置。
+
+    **`training_settings` 不是"全部设置"**（先前这里就是这么写的，不准）：它有
+    run 名、并行环境数、迭代数、每轮步数、存盘间隔、设备、种子、目录、W&B 设置、
+    折扣与 GAE 系数、三个维度、任务 id（v3 另有 minibatch 划分与 symmetry 配置）——
+    但**没有** learning_rate / clip_param / entropy_coef / value_loss_coef /
+    desired_kl 这几个优化侧的超参。它们目前写死在各版本的 `__init__` 里，
+    也就是说：**换了超参重跑，从 checkpoint 分不出这一份是哪套超参训的。**
+    本篇三档对照用的是同一套超参，所以暂时没有代价；要做超参扫描时得先补上。
 
     Args:
         path: 目标文件路径。
@@ -254,6 +275,14 @@ class DuckRolloutDataset(IterableDataset):
             with torch.no_grad():
                 actions, log_probs, values, action_means, action_stds = self.model.act(obs, critic_obs)
             next_obs, next_critic_obs, rewards, dones, info = env.step(actions)
+            # 日志累加的是**环境给的原始奖励**，不含下面那个超时自举项。
+            # 三档同台图的纵轴靠这个数，而 v1 没有 critic、也就没有自举项 ——
+            # 拿"加过自举"的数去和"没加"的比，纵轴就不是同一把尺子。
+            # 实测口径：velocity-flat 的回合 1000 步、每轮采 24 步 ⇒ 约 0.1% 的
+            # 环境步是超时步，那些步上加的是 γ·V(s)，V 的量级是 reward/(1−γ)，
+            # 于是均值被抬高约一成；回合越短抬得越多（前滚翻 250 步一回合 ⇒ 数倍）。
+            # 上游 rsl_rl 也是这么分的：自举加在 clone 上，日志用原始值。
+            reward_sum += float(rewards.mean().detach().cpu())
             if "time_outs" in info:
                 rewards = rewards + self.gamma * values.squeeze(-1) * info["time_outs"].float()
 
@@ -270,7 +299,6 @@ class DuckRolloutDataset(IterableDataset):
             self.model.update_actor_normalizer(next_obs)
             self.model.update_critic_normalizer(next_critic_obs)
             obs, critic_obs = next_obs, next_critic_obs
-            reward_sum += float(rewards.mean().detach().cpu())
 
         with torch.no_grad():
             next_value = self.model.value(critic_obs)
@@ -374,7 +402,10 @@ class DuckLightningPPO(L.LightningModule):
         self.training_settings = training_settings
         self.wandb_project = wandb_project
         self.wandb_mode = wandb_mode
-        self.latest_checkpoint = self.checkpoint_dir / "model_0.pt"
+        # 初值是 None，不是一个看起来像路径的假值：还没存过盘时调用方必须能分辨。
+        # 先前这里是 `checkpoint_dir / "model_0.pt"`，那个文件从来不存在 ——
+        # 一旦哪一轮没存上盘，run_training 就返回一条死路径而不报错。
+        self.latest_checkpoint: Path | None = None
         self.wandb_run = None
         self.optimizer = None
         self.latest_kl = torch.zeros(())
@@ -469,9 +500,19 @@ class DuckLightningPPO(L.LightningModule):
 
     def on_train_epoch_end(self):
         """把本轮各 minibatch 的指标平均后上报，并按需存盘。"""
+        iteration = self.current_epoch + 1
+        # 存盘的判据只看迭代号，不受「这一轮有没有指标」影响。
+        # 先前 `if not self.epoch_records: return` 挡在存盘前面：万一最后一轮没产出
+        # 记录，最终 checkpoint 就不存了，而 run_training 返回一条死路径 ——
+        # 一次三小时的训练「成功」结束、拿不到权重，且不报错。
+        # v1/v2 没有这个问题：它们在 training_step 里存盘，不经过这个钩子。
+        # 指标可以缺（那一轮就不 log），权重不能缺。
+        if iteration % self.save_interval == 0 or iteration == self.max_iterations:
+            self.latest_checkpoint = self.checkpoint_dir / f"model_{iteration}.pt"
+            save_checkpoint(self.latest_checkpoint, self.model, self.optimizer, iteration,
+                            self.training_settings)
         if not self.epoch_records:
             return
-        iteration = self.current_epoch + 1
         metrics = {
             key: sum(r[key] for r in self.epoch_records) / len(self.epoch_records)
             for key in self.epoch_records[0]
@@ -481,9 +522,6 @@ class DuckLightningPPO(L.LightningModule):
         metrics["lr"] = self.latest_lr
         wandb.log(metrics, step=iteration)
         append_metrics(self.checkpoint_dir / "metrics.jsonl", iteration, metrics)
-        if iteration % self.save_interval == 0 or iteration == self.max_iterations:
-            self.latest_checkpoint = self.checkpoint_dir / f"model_{iteration}.pt"
-            save_checkpoint(self.latest_checkpoint, self.model, self.optimizer, iteration, self.training_settings)
 
     def mirror_loss(self, obs, critic_obs, action_means):
         """算左右镜像的一致性损失：把镜子里的观测喂进去，应当得到镜子里的动作。
@@ -626,7 +664,7 @@ def run_training(run_name, num_envs, max_iterations, num_steps_per_env, save_int
     policy = ActorCritic(obs_dim=env.obs_dim, critic_obs_dim=env.critic_obs_dim, action_dim=env.action_dim)
     policy.to(env.device)
 
-    # 对称性只有任务自己知道要不要（前滚翻要，其余十几个都不要），所以问注册表。
+    # 对称性只有任务自己知道要不要（33 个任务里只有前滚翻要），所以问注册表。
     symmetry_cfg = task_symmetry_cfg(env.task)
 
     training_settings = {
@@ -663,6 +701,7 @@ def main():
     run_training(
         run_name=f"{task_slug()}-ppo",
         num_envs=NUM_ENVS,
+        seed=SEED,
         max_iterations=MAX_ITERATIONS,
         num_steps_per_env=24,
         save_interval=200,

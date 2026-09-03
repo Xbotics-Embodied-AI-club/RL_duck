@@ -46,10 +46,20 @@ dev = ["pytest", "ruff"]
 # （`on_before_optimizer_step` 丢掉 Lightning 传进来的 optimizer，见那个函数的注释）。
 # 一份会被学员照抄工程规矩的材料，判据不能是"默认值"。
 #
-# 与主仓的唯一差异是 `target-version`：本仓 `requires-python` 钉 >=3.12,<3.13
-# （上游 microduck_rl 经 bam 钉的），所以写 py312 而不是主仓的 py311。
-# 这不是口径分歧，是本仓解释器版本的事实。主仓那条 `extend-exclude = ["vendored"]`
-# 也没搬 —— 本仓没有 vendored/，留着就是给一条不存在的路径配规则。
+# 与主仓的差异，逐条列清（先前这里写"唯一差异是 target-version"，那句话不成立）：
+#   · `target-version = "py312"` 而非主仓的 py311 —— 本仓 `requires-python` 钉
+#     >=3.12,<3.13（上游 microduck_rl 经 bam 钉的）。这是解释器版本的事实，不是口径分歧。
+#   · 没搬 `extend-exclude = ["vendored"]` —— 本仓没有 vendored/，
+#     留着就是给一条不存在的路径配规则。
+#   · **没搬主仓的 `[tool.pyright]` / `[tool.vulture]` / `[tool.pytest.ini_options]`
+#     三整节。** 后果要说清：本仓的收尾判据目前只有 ruff 一件，vulture 与类型检查
+#     在这里根本没跑过；照抄主仓那份 vulture 配置也不够，本仓多出四个 Lightning
+#     生命周期钩子（`on_train_epoch_start` 一类）需要进 ignore_names。
+#     这是**已知的判据缺口**，写在这里以免"ruff 全绿"被读成"判据齐全"。
+#   · 不配 `[tool.ruff.lint.pydocstyle]`：`select` 里没有 `D`，配了不生效 ——
+#     先前那节 `convention = "google"` 就是一条不起作用的配置。真开 `D` 是 137 条，
+#     其中 121 条是 D415（"首行须以句号结尾"）被中文句号"。"触发的假阳，
+#     所以本仓的 docstring 规范靠 CODING_STANDARDS.md 与复核执行，不靠 ruff。
 # ─────────────────────────────────────────────────────────────────────────────
 [tool.ruff]
 line-length = 100
@@ -77,8 +87,13 @@ ignore = ["E501"]   # 行长交给 formatter，不在 lint 里报
 # 测试里允许 assert；也允许重复 —— DAMP 优先于 DRY。
 "**/tests/**" = ["S101", "ARG"]
 
-[tool.ruff.lint.pydocstyle]
-convention = "google"
+[tool.ruff.lint.isort]
+# `wandb` 必须显式声明成第三方，否则 **lint 结论会取决于本机跑过没跑过训练**：
+# 离线训练在仓根生成一个（被 gitignore 的）`wandb/` 目录，isort 看到同名目录就把
+# `import wandb` 判成本地包、要求它排到另一组去。于是同一份代码在训练过的机器上
+# 报 I001、在干净检出上全绿 —— 而两边都不报"为什么不一样"。
+# 判据不能建在"本机有没有某个临时目录"上。
+known-third-party = ["wandb"]
 
 [tool.uv]
 package = false

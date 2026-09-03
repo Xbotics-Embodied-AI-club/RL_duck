@@ -5,7 +5,8 @@
 从 mjlab 的任务注册表取出环境配置、把并行环境数定下来、把 mjlab 按组返回的观测拆成
 actor 和 critic 各自那一份。三个训练版本共用本文件，对照时环境完全一致。
 
-**换任务只改 `TASK` 那一行。** 十几个任务共用同一份训练代码，这正是第 8 节要证明的事。
+**换任务只改 `TASK` 那一行。** 注册表里 33 个任务（13 个平地主任务 + 碎石地与带齿隙孪生）
+共用同一份训练代码，这正是第 8 节要证明的事。
 
 讲义对应：第 2 节（观测与动作）、4.9 节（代码地图）、5.5 节（代码走读）、8.1 节（换任务）。
 """
@@ -49,6 +50,13 @@ NUM_ENVS = int(os.environ.get("RL_DUCK_NUM_ENVS") or _DEFAULT_NUM_ENVS)
 # 4000–6000；episodic 的动作类 1000 上下，换任务时把这里改成 2000 即可。
 _DEFAULT_MAX_ITERATIONS = 6000
 MAX_ITERATIONS = int(os.environ.get("RL_DUCK_MAX_ITERATIONS") or _DEFAULT_MAX_ITERATIONS)
+
+# 随机种子。三档对照必须同种子，所以它也声明在这里而不是各 main() 里。
+# 可覆盖的理由：难的动作（起身）一次运行成不成有随机性，同配方换种子并行开两档、
+# 取好的那个，比串行等一档跑完再决定省几个小时。**换了种子就不再是同一次实验**——
+# 讲义里引用的曲线一律用默认种子那档。
+_DEFAULT_SEED = 1
+SEED = int(os.environ.get("RL_DUCK_SEED") or _DEFAULT_SEED)
 # =====================================================================
 
 
@@ -71,7 +79,7 @@ def task_symmetry_cfg(task: str = TASK) -> dict | None:
     """取任务自己声明的左右对称性增广配置。
 
     对称性是**算法侧**的东西（一个镜像一致性损失，加在 PPO 的 loss 上），不像奖励表和
-    课程表那样由 mjlab 内部驱动 —— 所以训练器必须自己去问任务要不要它。十几个任务里
+    课程表那样由 mjlab 内部驱动 —— 所以训练器必须自己去问任务要不要它。13 个平地主任务里
     只有前滚翻声明了 True（那个动作是严格左右对称的，镜像一致性正好压住"往一侧塌"）。
 
     值从 mjlab 的任务注册表里取，不在这边另列一份任务名到开关的表：注册表是唯一声明处，
@@ -79,7 +87,7 @@ def task_symmetry_cfg(task: str = TASK) -> dict | None:
 
     `.algorithm` 直接取属性、不用 `getattr(..., None)`：上游改名时要当场 `AttributeError`。
     用默认值兜住它是这里最危险的写法 —— 兜住的结果是**镜像损失整个静默关掉**，
-    而十几个任务里有十几个本来就返回 None，看日志分不出"这个任务不需要"和"字段名找不到了"。
+    而 33 个任务里除前滚翻之外全都本来就返回 None，看日志分不出"这个任务不需要"和"字段名找不到了"。
 
     `symmetry_cfg` 那一层保留 `getattr` 默认值，因为**缺席就是"不启用"是上游自己的语义**：
     只有前滚翻用的 `PpoWithSymmetryCfg` 有这个字段，其余任务用的基类 `RslRlPpoAlgorithmCfg`
@@ -119,7 +127,10 @@ class DuckEnv:
 
     默认是平地速度指令行走：每个回合给一个随机目标速度（前进 / 侧移 / 转向）＋一个
     头部姿态指令，奖励让它跟上指令并保持直立。换 `TASK` 就换成别的动作，本类不用改——
-    每个任务的观测布局都是同一份 61 维，动作都是 14 个舵机。
+    每个任务的观测布局都是同一份：**actor 61 维、critic 76 维**，动作都是 14 个舵机。
+    两个数不一样是有意的（见 `split_actor_critic_obs`）—— 实测 critic 侧多出的 15 维是
+    基座真实线速度 3、双脚高度 2、双脚腾空时间 2、双脚接触 2、接触力 6。
+    先前这里只写「同一份 61 维」，那句话漏掉了 critic 那一侧。
 
     回合长度不在这里覆盖：走路是长回合，起身、坐站那些是短回合，各任务的配置里
     已经按自己的需要定好了，硬塞一个统一值会把 episodic 任务弄坏。
@@ -206,7 +217,18 @@ class DuckEnv:
                 cfg.viewer.entity_name = "robot"
 
         self.task = task
-        resolved_device = device if torch.cuda.is_available() or device == "cpu" else "cpu"
+        # 要 GPU 但机器上没有 CUDA ⇒ **报错停下，不回落到 CPU**。
+        # 先前这里是 `device if torch.cuda.is_available() or device == "cpu" else "cpu"`，
+        # 静默降级。代价不是"慢一点"：MuJoCo Warp 是 GPU 后端，4096 个环境落到 CPU 上
+        # 会把一次二十分钟的训练拖成十几小时，而进度条照样在动、日志照样在写 ——
+        # 等发现不对时已经烧掉半天。真要跑 CPU 就显式传 device="cpu"。
+        if device != "cpu" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"要求 device={device!r} 但这台机器上 torch.cuda.is_available() 为假。"
+                "本仓不做静默降级 —— MuJoCo Warp 落到 CPU 上会让训练慢两个数量级而不报错。"
+                "确实要用 CPU 就显式传 device=\"cpu\"。"
+            )
+        resolved_device = device
         self._env = ManagerBasedRlEnv(cfg=cfg, device=resolved_device, render_mode=render_mode)
         self.device = torch.device(self._env.device)
         self.num_envs = self._env.num_envs

@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -37,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from env import TASK, DuckEnv, task_slug
 from model import ActorCritic
 from plot_reward_curves import use_project_font
-from rollout import align_curriculum, load_policy
+from rollout import align_curriculum, check_task_match, load_policy
 
 # ======================== 这一轮渲什么 ========================
 # 权重文件。留空就自动取当前 TASK 的 PPO 那一档**最新**的 checkpoint；
@@ -85,7 +86,17 @@ PARALLEL_PREROLL = 12
 PARALLEL_RECORD = 1000
 
 # 关键帧序列：横排几帧。取帧的**窗口**不是常量，按任务的回合长度算（见 keyframe_window）。
-KEYFRAME_COUNT = 5
+# 取 6 帧、排成两行三列（见 render_keyframes 里为什么不横排一行）。
+# 6 而不是 5：5 帧在三列网格里会空出一格，而 6 帧刚好填满两行。
+#
+# ⚠️ **6 帧是给讲义排版用的，不一定够用来判定动作有没有出现。**
+# 短回合任务（前滚翻 250 步、起身 300 步）按 6 帧取样，相邻帧间隔 40–50 步；
+# 而一个前滚翻在 50 赫兹下大概只要 30–60 步 —— **整个动作可能落在两帧之间，看不见。**
+# 判定用的探针渲图应当加密取样：`RL_DUCK_KEYFRAME_COUNT=12` 按进程覆盖它
+# （12 帧配 4 列是三行，版面照样成立）。讲义里用的图仍取默认的 6。
+_DEFAULT_KEYFRAME_COUNT = 6
+KEYFRAME_COUNT = int(os.environ.get("RL_DUCK_KEYFRAME_COUNT") or _DEFAULT_KEYFRAME_COUNT)
+KEYFRAME_COLS = int(os.environ.get("RL_DUCK_KEYFRAME_COLS") or 3)
 # 长回合、周期性动作（走路）的取帧窗口：跳掉启动瞬态，再取一段。
 KEYFRAME_STEPS = 260
 KEYFRAME_SKIP = 60
@@ -100,15 +111,28 @@ EPISODIC_THRESHOLD_SECONDS = 10.0
 
 # 开篇拼图：按这个顺序摆格子。每个元素是一个 task slug，
 # 对应 `result/<slug>/keyframes.png` 必须已经渲好。缺哪个就跳过哪个。
+#
+# **这张表只放看图确认学成了的动作。** 讲义开篇是"先给结果"，摆一个其实没学成的
+# 动作进去，等于开篇就在骗人。
+# 不在这里的两档，各有各的判定依据（都是看图判的，不是看奖励数字）：
+#   · 踢球：课程表末档第 1500 迭代、我们给了 2000（预算够），画面上鸭子侧倒、
+#     球没动 ⇒ 真没学成（bd xb-8ffo）。
+#   · 坐立：跑到自己课程表 88%（末档 2500）仍六帧十二帧都一动不动，已停训（bd xb-zucf）。
+#   · 起身：按配方跑满 6000（超末档 4000 两千），3200/4000/6000 三个判定点画面完全相同，
+#     只到"把躯干撑起约 45 度并维持"，从不站起（bd xb-p4c3）。
+# 这六格正好是六个看图确认成功的动作。**缺项会被自动跳过**，
+# 所以万一某一格的关键帧还没渲，拼图不会失败，只会少一格 —— 建完记得数格子。
+# 每格：(task slug, 讲义里那个动作的中文名)。中文名写在这里而不是用 slug ——
+# 开篇拼图是给读者看的，`velocity-flat-rollers` 对读者不是信息。
 COVER_LAYOUT = (
-    "velocity-flat",
-    "velocity-flat-rollers",
-    "standup-flat",
-    "spin-flat",
-    "ballkick-flat",
-    "sitstand-flat",
+    ("velocity-flat", "走路"),
+    ("velocity-flat-rollers", "轮滑"),
+    ("spin-flat", "原地旋转"),
+    ("groundpick-flat", "嘴尖取物"),
+    ("rollercrouch-flat", "蹲姿滑行"),
+    ("roulade-flat", "前滚翻"),
 )
-COVER_COLUMNS = 2
+COVER_COLUMNS = 3
 # ==============================================================
 
 
@@ -176,10 +200,21 @@ def parallel_camera(num_envs: int, checkpoint: str | None) -> tuple[float, float
     # MuJoCo 的 azimuth 是绕竖直轴的角度（度）；取主轴方向再转 90°，
     # 相机就从垂直于主轴的方向看过去，那条线在画面里横着铺满。
     azimuth = float(np.degrees(np.arctan2(axis[1], axis[0])) + 90.0)
-    # 竖直视角约 45 度、16:9，所以水平视野 ≈ 2·d·tan(38°) ≈ 1.56·d。
-    # 要让主轴跨度只占画面宽的 70%（两边留边），d ≈ 跨度 / (1.56 × 0.7)。
-    # 再加上纵深那一档的一半，免得靠后的那几只被上边缘切掉。
-    distance = long_extent / 1.09 + short_extent * 0.5 + 0.6
+    # 竖直视角 45 度、16:9 ⇒ 水平半角 = atan(tan22.5° × 16/9) = 36.4°，
+    # 所以画面在距离 d 处的实际宽度 ≈ 2·d·tan(36.4°) = 1.475·d。
+    #
+    # 余量**全部按比例给**，不再加常数项。先前那版写的是
+    # `long_extent / 1.09 + short_extent * 0.5 + 0.6`，两个加数把距离整体推远了六成：
+    # 旋转那张图主轴只跨 1.6 米，按 80% 填充该站 1.36 米，那版算出 2.47 米，
+    # 于是六只鸭子只占画面宽的一半、下面一大片空地板。**这就是"渲得太小"的成因** ——
+    # 常数余量在跨度小的时候占比最大，而跨度小恰恰是原地动作（旋转、起身）的常态。
+    #
+    # 纵深项保留但只给 0.35 倍：靠后那几只需要一点后仰余量，但它不该按 1:1 吃掉画面。
+    #
+    # 下限 0.8 米是必需的，不是保险：`num_envs == 1` 时两个跨度都是 0，
+    # 纯比例式会算出 0 —— 相机落在鸭子体内，渲出来是一片糊。0.8 与单只关键帧
+    # 那档（KEYFRAME_DISTANCE）取同一个值，两种图的观感才一致。
+    distance = max(long_extent / (1.475 * 0.80) + short_extent * 0.35, KEYFRAME_DISTANCE)
     lookat = (float(center[0]), float(center[1]), 0.22)
     print(f"一群那张图：{num_envs} 只，实测主轴跨 {long_extent:.2f} 米、纵深 {short_extent:.2f} 米"
           f" => 相机 {distance:.2f} 米 / 方位 {azimuth:.0f}° / 俯 {PARALLEL_ELEVATION}° / 看向 {lookat}")
@@ -256,8 +291,13 @@ def make_policy(env: DuckEnv, checkpoint: str | None):
     """
     if checkpoint:
         model, iteration, settings = load_policy(checkpoint, env.device)
-        # 与 rollout 同一口径：出图前把课程表对齐到这份权重训练到的那一档，
-        # 否则渲的是「第 0 档课程下的初始姿态」，不是这份权重实际面对的分布。
+        # 与 rollout 同一口径，两件事都要：
+        # ① 核对这份权重是不是当前任务训的 —— 十八个任务的观测/动作维度全相同，
+        #    错配不会报形状错，只会渲出一段"这个动作没学会"的画面并覆盖真结果。
+        #    批量出图时一台机器七个进程各带一份 TASK 与 CHECKPOINT，错配一次就说不清了。
+        # ② 把课程表对齐到这份权重训练到的那一档，否则渲的是「第 0 档课程下的初始姿态」，
+        #    不是这份权重实际面对的分布。
+        check_task_match(env, settings, checkpoint)
         align_curriculum(env, iteration, settings)
         return model, f"iter{iteration}"
     model = ActorCritic(
@@ -390,20 +430,39 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
     finally:
         env.close()
 
-    usable = frames[skip:] or frames
-    if not usable:
+    if not frames:
         raise RuntimeError("render() 一帧都没回 —— 检查 render_mode 与 viewer 配置")
+    # 跳帧与标签必须用**同一个** offset。先前写的是 `frames[skip:] or frames`：
+    # 跳完为空时静默退回全部帧（等于不跳），而下面的标签仍然 `+skip` ——
+    # 于是五个步号整体多标 60 步，图上写"第 60 步"其实是第 0 步。
+    # 图照样出、脚本照样退 0，错的只是纸上那行小字。
+    offset = skip if len(frames) > skip else 0
+    if offset != skip:
+        print(f"⚠ 只渲到 {len(frames)} 帧，不够跳过 {skip} 帧 —— 改为从第 0 帧取，步号跟着改")
+    usable = frames[offset:]
     picks = np.linspace(0, len(usable) - 1, KEYFRAME_COUNT).round().astype(int)
     strip = [usable[i] for i in picks]
 
     use_project_font()
-    fig, axes = plt.subplots(1, KEYFRAME_COUNT, figsize=(2.3 * KEYFRAME_COUNT, 2.6), dpi=200)
-    for ax, img, idx in zip(np.atleast_1d(axes), strip, picks, strict=True):
+    # 排成 KEYFRAME_COLS 列的网格，**不是一行横排**。
+    # 一行横排在屏幕上没问题，进 PDF 就废了：六帧一行的图宽高比 4.4:1，
+    # 缩到正文宽（约 16 厘米）之后每帧只有 2.7 厘米，鸭子在纸上小到看不出姿态。
+    # 实测第一版 PDF 的取物那张就是这样 —— 图在、看不清，等于没有。
+    # 两行三列把宽高比压到 1.3:1，每帧的线性尺寸大 67%、面积近三倍。
+    rows = -(-KEYFRAME_COUNT // KEYFRAME_COLS)
+    fig, axes = plt.subplots(rows, KEYFRAME_COLS,
+                             figsize=(3.0 * KEYFRAME_COLS, 3.4 * rows), dpi=200)
+    flat = np.atleast_1d(axes).ravel()
+    for ax, img, idx in zip(flat, strip, picks, strict=False):
         ax.imshow(img)
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_xlabel(f"第 {int(idx) + skip} 步", fontsize=8)
-    fig.suptitle(TASK.removeprefix("Mjlab-").replace("-MicroDuck", ""), fontsize=10)
+        ax.set_xlabel(f"第 {int(idx) + offset} 步", fontsize=9)
+    # 帧数不是列数整数倍时，多出来的格子关掉，别留一个空白坐标框。
+    for ax in flat[len(strip):]:
+        ax.axis("off")
+    # 不加 suptitle：任务名在讲义的图题里已经写了，图上再印一遍英文 task id
+    # 是给中文读者添一层要忽略的东西。
     fig.tight_layout()
     out = result_dir() / f"keyframes-{tag}.png"
     fig.savefig(out)
@@ -412,39 +471,98 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
     return out
 
 
+def _trained_keyframes(task_dir: Path) -> list[Path]:
+    """列出某个任务已渲好的关键帧图，**按迭代号数值排序**，并排除未训练那版。
+
+    这里曾经写的是 `sorted(glob("keyframes-*.png"))[-1]` —— 字典序，两处都错：
+
+    · `keyframes-untrained.png` 排在 `keyframes-iter6000.png` **后面**（`u` > `i`），
+      于是"最新"取到的是**随机初始化策略**那张。开篇拼图的标题是
+      「这里没有一个动作是人教的」，那一格摆的却是一只根本没学过的鸭子。
+      已提交的 cover.png 里走路那格就是这个。
+    · `iter400` 排在 `iter2000` 后面（`4` > `2`），轮滑与起身两格取到了 400 而不是 2000。
+
+    同一个文件里 `latest_checkpoint()` 已经在用数值排序（`int(stem.split("_")[1])`）——
+    两种写法并存，错的那种没人看出来，因为它**照样返回一个存在的文件**。
+
+    Args:
+        task_dir: `result/<task-slug>/` 目录。
+
+    Returns:
+        按迭代号升序的路径列表；目录不存在或只有未训练那版时返回空列表。
+    """
+    if not task_dir.is_dir():
+        return []
+    numbered = []
+    for p in task_dir.glob("keyframes-iter*.png"):
+        m = re.fullmatch(r"keyframes-iter(\d+)", p.stem)
+        if m:
+            numbered.append((int(m.group(1)), p))
+    return [p for _n, p in sorted(numbered)]
+
+
+def _latest_parallel(task_dir: Path) -> Path | None:
+    """某个任务最新那张并行仿真图，按迭代号数值排序。
+
+    与 `_trained_keyframes` 同一个判据（数值序），只是文件名前缀不同。
+    两处都不能用字典序 —— `iter400` 会排在 `iter2000` 后面。
+
+    Args:
+        task_dir: `result/<task-slug>/` 目录。
+
+    Returns:
+        迭代号最大的那张并行图；没有就返回 None。
+    """
+    if not task_dir.is_dir():
+        return None
+    numbered = []
+    for p in task_dir.glob("parallel-iter*.png"):
+        m = re.fullmatch(r"parallel-iter(\d+)", p.stem)
+        if m:
+            numbered.append((int(m.group(1)), p))
+    return max(numbered)[1] if numbered else None
+
+
 def build_cover() -> Path | None:
-    """把各动作已渲好的关键帧摆成开篇那张拼图。
+    """把各动作已渲好的**并行仿真图**摆成开篇那张拼图。
 
     只读已有的 PNG，不重新渲 —— 所以它可以在每训完一个动作之后重跑一次，
     格子会一个个填上。
+
+    **用并行图而不是关键帧拼版**：关键帧本身就是一张 2×3 的拼版，再把六张拼版
+    拼成一张，就成了"拼图的拼图" —— 实测那样每只鸭子只剩四十来像素，
+    开篇第一张图什么都看不清。并行图是单张场景、本来就撑得住缩小，
+    而且六只一起出现比单只更有开篇该有的分量。
 
     Returns:
         写出的 PNG 路径；一张都凑不出来时返回 None。
     """
     root = Path(__file__).resolve().parents[1] / "result"
     tiles: list[tuple[str, np.ndarray]] = []
-    for slug in COVER_LAYOUT:
-        found = sorted((root / slug).glob("keyframes-*.png")) if (root / slug).is_dir() else []
-        if not found:
-            print(f"拼图缺一格：{slug}（还没渲关键帧）")
+    for slug, label in COVER_LAYOUT:
+        pick = _latest_parallel(root / slug)
+        if pick is None:
+            print(f"拼图缺一格：{label}（{slug} 还没渲出并行图）")
             continue
-        tiles.append((slug, plt.imread(found[-1])))
+        print(f"拼图取 {label}（{slug}）: {pick.name}")
+        tiles.append((label, plt.imread(pick)))
     if not tiles:
-        print("一格都凑不出来，先渲各动作的关键帧。")
+        print("一格都凑不出来，先渲各动作的并行图。")
         return None
 
     use_project_font()
     rows = -(-len(tiles) // COVER_COLUMNS)
-    fig, axes = plt.subplots(rows, COVER_COLUMNS, figsize=(6.6 * COVER_COLUMNS, 2.2 * rows), dpi=200)
+    # 每格 5.4×3.2 英寸，对应并行图的 16:9。
+    fig, axes = plt.subplots(rows, COVER_COLUMNS, figsize=(5.4 * COVER_COLUMNS, 3.2 * rows), dpi=200)
     flat = np.atleast_1d(axes).ravel()
-    for ax, (slug, img) in zip(flat, tiles, strict=False):
+    for ax, (label, img) in zip(flat, tiles, strict=False):
         ax.imshow(img)
         ax.set_xticks([])
         ax.set_yticks([])
-        ax.set_title(slug, fontsize=9)
+        ax.set_title(label, fontsize=12)
     for ax in flat[len(tiles):]:
         ax.axis("off")
-    fig.suptitle("这里没有一个动作是人教的", fontsize=13)
+    fig.suptitle("这里没有一个动作是人教的", fontsize=17)
     fig.tight_layout()
     out = root / "cover.png"
     fig.savefig(out)

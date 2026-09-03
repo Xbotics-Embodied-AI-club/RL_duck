@@ -1,14 +1,14 @@
 {
-  "action_abs_mean": 0.2713415315374732,
-  "checkpoint": "/mnt/nas_datasets/models/trained/rl_duck/velocity-flat-ppo/model_6000.pt",
+  "action_abs_mean": 0.3316186548769474,
+  "checkpoint": "/mnt/nas_datasets/models/trained/rl_duck/velocity-flat-a2c/model_6000.pt",
   "checkpoint_iteration": 6000,
   "curriculum_step": 144000,
   "episode_refreshes": 0,
   "episode_reward_terms": {},
   "episodes": 0,
-  "mean_reward": 0.15544456733390688,
+  "mean_reward": 0.12209842620417476,
   "num_envs": 16,
-  "run_name": "velocity-flat-ppo",
+  "run_name": "velocity-flat-a2c",
   "step_metrics": {
     "Curriculum/action_rate_weight": -1.0,
     "Curriculum/body_pose_range": 0.05000000074505806,
@@ -22,10 +22,10 @@
     "Episode_Termination/nan_state": 0.0,
     "Episode_Termination/out_of_terrain_bounds": 0.0,
     "Episode_Termination/time_out": 0.0,
-    "Metrics/air_time_mean": 0.12281068566720933,
-    "Metrics/angular_momentum_mean": 0.0028087935675021212,
-    "Metrics/peak_height_mean": 0.008127155503025278,
-    "Metrics/slip_velocity_mean": 0.014503214047290386,
+    "Metrics/air_time_mean": 0.025038317658472805,
+    "Metrics/angular_momentum_mean": 0.000855430029309261,
+    "Metrics/peak_height_mean": 0.0009170135347812903,
+    "Metrics/slip_velocity_mean": 0.004154558167065261,
     "Metrics/twist/error_vel_xy": 0.0,
     "Metrics/twist/error_vel_yaw": 0.0
   },
@@ -35,5 +35,5 @@
   "timeout_count": 0,
   "timeout_fraction": 0.0,
   "video_frames": 400,
-  "video_output": "/mnt/nas_code/Xpersonal/Xbotics2/rl_duck/result/velocity-flat/velocity-flat-ppo.mp4"
+  "video_output": "/mnt/nas_code/Xpersonal/Xbotics2/rl_duck/result/velocity-flat/velocity-flat-a2c.mp4"
 }

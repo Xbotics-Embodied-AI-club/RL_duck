@@ -19,11 +19,15 @@ uv run python code/train_v3_ppo.py          # 训一个策略
 `code/env.py` 顶部：
 
 ```python
-TASK = "Mjlab-Velocity-Flat-MicroDuck"      # 换成下面任意一个 task id
-NUM_ENVS = 4096                             # 并行环境数，按显存定
+_DEFAULT_TASK = "Mjlab-Velocity-Flat-MicroDuck"   # 换成下面任意一个 task id
+_DEFAULT_NUM_ENVS = 4096                          # 并行环境数；实测甜点是 8192
 ```
 
-可选任务用 `uv run python code/env.py` 打印（上游注册了十几个）。
+批量跑（一台机器多个任务）时用环境变量按进程覆盖，不必改文件：
+`RL_DUCK_TASK` / `RL_DUCK_NUM_ENVS` / `RL_DUCK_MAX_ITERATIONS` / `RL_DUCK_CHECKPOINT`。
+
+可选任务用 `uv run python code/env.py` 打印（上游注册了 33 个：13 个平地主任务，
+外加碎石地与带齿隙的孪生版）。
 结果目录与权重目录都从 `TASK` 派生，所以换任务不会覆盖上一个任务的产物。
 
 ## 目录

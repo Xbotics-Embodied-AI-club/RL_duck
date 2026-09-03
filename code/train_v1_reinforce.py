@@ -20,7 +20,7 @@ import wandb
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import MAX_ITERATIONS, NUM_ENVS, DuckEnv, task_slug
+from env import MAX_ITERATIONS, NUM_ENVS, SEED, DuckEnv, task_slug
 from model import ActorCritic
 
 
@@ -44,8 +44,16 @@ def default_checkpoint_root(run_name: str) -> Path:
 def save_checkpoint(path, model, optimizer, iteration, training_settings):
     """存一份可续训、也可直接拿去评测的权重。
 
-    优化器状态和这次训练的全部设置一起存下来，评测脚本才能凭 checkpoint 自己重建
-    出维度一致的网络，不必再猜环境配置。
+    优化器状态与 `training_settings` 一起存下来，评测脚本才能凭 checkpoint 自己重建
+    出维度一致的网络、并把课程表对齐到同一档，不必再猜环境配置。
+
+    **`training_settings` 不是"全部设置"**（先前这里就是这么写的，不准）：它有
+    run 名、并行环境数、迭代数、每轮步数、存盘间隔、设备、种子、目录、W&B 设置、
+    折扣与 GAE 系数、三个维度、任务 id（v3 另有 minibatch 划分与 symmetry 配置）——
+    但**没有** learning_rate / clip_param / entropy_coef / value_loss_coef /
+    desired_kl 这几个优化侧的超参。它们目前写死在各版本的 `__init__` 里，
+    也就是说：**换了超参重跑，从 checkpoint 分不出这一份是哪套超参训的。**
+    本篇三档对照用的是同一套超参，所以暂时没有代价；要做超参扫描时得先补上。
 
     Args:
         path: 目标文件路径。
@@ -204,7 +212,10 @@ class DuckLightningReinforce(L.LightningModule):
         self.training_settings = training_settings
         self.wandb_project = wandb_project
         self.wandb_mode = wandb_mode
-        self.latest_checkpoint = self.checkpoint_dir / "model_0.pt"
+        # 初值是 None，不是一个看起来像路径的假值：还没存过盘时调用方必须能分辨。
+        # 先前这里是 `checkpoint_dir / "model_0.pt"`，那个文件从来不存在 ——
+        # 一旦哪一轮没存上盘，run_training 就返回一条死路径而不报错。
+        self.latest_checkpoint: Path | None = None
         self.wandb_run = None
         self.optimizer = None
 
@@ -320,6 +331,10 @@ def run_training(run_name, num_envs, max_iterations, num_steps_per_env, save_int
         "seed": seed, "checkpoint_dir": str(checkpoint_dir), "wandb_project": wandb_project,
         "wandb_mode": wandb_mode, "gamma": gamma,
         "obs_dim": env.obs_dim, "critic_obs_dim": env.critic_obs_dim, "action_dim": env.action_dim,
+        # 权重是哪个任务训的，必须存下来。十八个任务的观测都是 61 维、动作都是 14 维，
+        # 所以拿 A 任务的权重去评 B 任务，**形状检查一个都拦不住** ——
+        # 它会安安静静写出一份看着正常的低分，并覆盖掉 B 的真结果。
+        "task": env.task,
     }
 
     data = DuckData(env, policy, num_steps_per_env, gamma)
@@ -346,6 +361,7 @@ def main():
     run_training(
         run_name=f"{task_slug()}-reinforce",
         num_envs=NUM_ENVS,
+        seed=SEED,
         max_iterations=MAX_ITERATIONS,
         num_steps_per_env=24,
         save_interval=200,
