@@ -205,7 +205,7 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
     # 读的人必须能分得出来。
     #
     # ⚠️ 判断动作有没有学成不要靠这些数（这批任务都是连续奖励，没有成功率指标）——
-    # 按 bd `xb-haj0`：**看关键帧图判定**。这里的数只用来做同口径的横向对照。
+    # 判定标准是**看关键帧图**。这里的数只用来做同口径的横向对照。
     episode_sums: dict[str, float] = {}
     step_sums: dict[str, float] = {}
     episode_refreshes = 0

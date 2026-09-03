@@ -60,7 +60,7 @@ VIDEOS: tuple[tuple[str, str], ...] = (
 )
 
 
-# 白边的判据与边距（bd xb-h26t）：非白像素包围盒，阈值 248、留 20 像素。
+# 白边的判据与边距：非白像素包围盒，阈值 248、留 20 像素。
 _WHITE_LEVEL = 248
 _WHITE_PAD = 20
 

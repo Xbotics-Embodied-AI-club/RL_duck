@@ -9,7 +9,7 @@
 
 跑法（在仓根）：
     RL_DUCK_TASK=Mjlab-Velocity-Flat-MicroDuck \
-    RL_DUCK_CKPT_ROOT=/mnt/nas_datasets/models/trained/rl_duck \
+    RL_DUCK_CKPT_ROOT=<权重根> \
     RL_DUCK_EVO_RUN=velocity-flat-ppo \
     XBOTICS_FIG_FONT=<TimesSong.ttf> MUJOCO_GL=egl \
       uv run python code/render_evolution.py
