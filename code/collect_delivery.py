@@ -31,9 +31,9 @@ FIGURES: tuple[tuple[str, str], ...] = (
     ("cover.png", "00-开篇动作带.png"),
     ("velocity-flat/parallel-velocity-flat-ppo-iter6000.png", "01-并行训练一屏.png"),
     ("velocity-flat/reward-reinforce.png", "02-v1-学习曲线.png"),
-    ("velocity-flat/keyframes-velocity-flat-reinforce-iter6000-12f3c.png", "03-v1-一整个回合.png"),
+    ("velocity-flat/keyframes-velocity-flat-reinforce-iter6000-16f4c.png", "03-v1-一整个回合.png"),
     ("velocity-flat/reward-a2c.png", "04-v2-学习曲线.png"),
-    ("velocity-flat/keyframes-velocity-flat-a2c-iter6000-12f3c.png", "05-v2-一整个回合.png"),
+    ("velocity-flat/keyframes-velocity-flat-a2c-iter6000-16f4c.png", "05-v2-一整个回合.png"),
     ("velocity-flat/ladder-reward.png", "06-三档学习曲线.png"),
     ("velocity-flat/keyframes-velocity-flat-ppo-iter6000-6f3c.png", "07-v3-走路.png"),
     ("velocity-flat-rollers/parallel-velocity-flat-rollers-ppo-iter2000.png", "08-轮滑.png"),
@@ -64,6 +64,20 @@ VIDEOS: tuple[tuple[str, str], ...] = (
 _WHITE_LEVEL = 248
 _WHITE_PAD = 20
 
+# 黑点的判据。渲染器会在画面上留下孤立的纯黑小方块 —— 实测是渲染侧留下的，不是编码
+# 造成的（同一批帧直接存 PNG 与转成 mp4 再读回来，极暗像素数一模一样；crf 16 也一样），
+# 所以重渲一遍治不了它，只能在收件这一步补掉。
+#
+# 判据三条同时成立才补，为的是**不碰真内容**：
+#   ① 极暗（亮度 < 20）—— 那些方块是纯黑的；
+#   ② 连通块小（≤ 400 像素）—— 机器人身上的深色件是大块连通区域；
+#   ③ 四周一圈是中间调（中位亮度 25–160）—— 地板是这个区间。
+# 第三条是关键的那道闸：曲线图上的黑字与坐标轴也满足①②，但它们四周是**近白**的画布，
+# 被第三条挡在外面。改完逐张比过：三张曲线图零像素变化。
+_SPECK_DARK = 20
+_SPECK_MAX_AREA = 400
+_SPECK_RING_LO, _SPECK_RING_HI = 25, 160
+
 
 def crop_white_border(src: Path, dst: Path) -> None:
     """把图四周的白边裁掉再写到交付目录。
@@ -73,11 +87,17 @@ def crop_white_border(src: Path, dst: Path) -> None:
     排版上这条留白表现为"图与图注之间空一大条"，而**收 width% 治不了它** ——
     等比缩放留白跟着缩，相对位置一点不变。
 
+    顺手把渲染器留下的孤立黑点补掉（见 `fill_render_specks`）—— 它们和白边一样
+    是"渲出来就有、重渲还有"的东西，收件是唯一能一次治完所有图的位置。
+
     Args:
         src: 过程产物里的原图。
         dst: 交付目录里的目标路径。
     """
     img = Image.open(src).convert("RGB")
+    img, specks = fill_render_specks(img)
+    if specks:
+        print(f"      补掉 {specks} 个渲染黑点")
     mask = (np.asarray(img) < _WHITE_LEVEL).any(axis=2)
     ys, xs = np.where(mask)
     if ys.size == 0:
@@ -87,6 +107,83 @@ def crop_white_border(src: Path, dst: Path) -> None:
     box = (max(int(xs.min()) - _WHITE_PAD, 0), max(int(ys.min()) - _WHITE_PAD, 0),
            min(int(xs.max()) + 1 + _WHITE_PAD, w), min(int(ys.max()) + 1 + _WHITE_PAD, h))
     img.crop(box).save(dst)
+
+
+def _dark_blobs(dark: np.ndarray, max_area: int) -> list[list[tuple[int, int]]]:
+    """把极暗掩码里的连通块找出来，只留面积不超过 `max_area` 的那些。
+
+    自己写的广度优先，不引 scipy：一张图上极暗像素才一千来个，遍历代价可以忽略，
+    而少一个依赖意味着收件这一步在任何机器上都跑得动（它已经不依赖仿真器了）。
+
+    Args:
+        dark: (H, W) 的布尔掩码，True 表示极暗。
+        max_area: 超过这个面积就不算黑点，直接丢弃（机器人身上的深色件是大块）。
+
+    Returns:
+        每个小连通块的像素坐标列表。
+    """
+    h, w = dark.shape
+    seen = np.zeros_like(dark)
+    blobs = []
+    for y0, x0 in zip(*np.where(dark), strict=True):
+        if seen[y0, x0]:
+            continue
+        stack, pix = [(int(y0), int(x0))], []
+        seen[y0, x0] = True
+        while stack:
+            y, x = stack.pop()
+            pix.append((y, x))
+            if len(pix) > max_area:
+                break
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and dark[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pix) <= max_area:
+            blobs.append(pix)
+    return blobs
+
+
+def fill_render_specks(img: Image.Image) -> tuple[Image.Image, int]:
+    """把渲染器留下的孤立纯黑小方块补成周围的颜色。
+
+    补的值取那一圈的中位色，不做插值：那些方块落在地板上，地板是平缓渐变，
+    中位色看不出接缝；而插值会在方块边缘留一道更显眼的糊边。
+
+    Args:
+        img: RGB 图。
+
+    Returns:
+        (补过的图, 补掉了几个块)。
+    """
+    a = np.asarray(img).copy()
+    lum = a.mean(axis=2)
+    blobs = _dark_blobs(lum < _SPECK_DARK, _SPECK_MAX_AREA)
+    h, w = lum.shape
+    filled = 0
+    for pix in blobs:
+        ys = [p[0] for p in pix]
+        xs = [p[1] for p in pix]
+        y0, y1 = max(min(ys) - 3, 0), min(max(ys) + 4, h)
+        x0, x1 = max(min(xs) - 3, 0), min(max(xs) + 4, w)
+        patch = lum[y0:y1, x0:x1]
+        ring = patch[patch >= _SPECK_DARK]
+        if ring.size == 0:
+            continue
+        med = float(np.median(ring))
+        # 四周不是中间调就不动它 —— 近白的四周说明这是画布上的字，不是地板上的黑点。
+        if not _SPECK_RING_LO <= med <= _SPECK_RING_HI:
+            continue
+        block = a[y0:y1, x0:x1]
+        mask = lum[y0:y1, x0:x1] >= _SPECK_DARK
+        if not mask.any():
+            continue
+        color = np.median(block[mask], axis=0)
+        for y, x in pix:
+            a[y, x] = color
+        filled += 1
+    return Image.fromarray(a), filled
 
 
 def copy_set(pairs: tuple[tuple[str, str], ...], out_dir: Path) -> list[str]:

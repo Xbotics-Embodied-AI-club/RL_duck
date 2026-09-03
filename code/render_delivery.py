@@ -29,17 +29,21 @@ from pathlib import Path
 # 一个动作一行：
 #   名字 · 任务 id · 权重相对路径 · 关键帧数 · 关键帧列数 ·
 #   单只视频机位（"track" 跟拍 / "fixed" 世界固定）· 单只视频步数 · 钉住的速度指令
+#
+# **v1/v2 那两张「一整个回合」定的是 16 帧 4 列**（用户口径）：1000 步的回合用 16 帧
+# 取样、相邻帧约 62–63 步，比 12 帧那版（相邻 85 步）更看得出姿态在两帧之间怎么变。
+# 16 帧要配 4 列 —— 3 列除不尽，末行会缺格。
 JOBS: tuple[dict, ...] = (
     {"name": "走路-v3PPO", "task": "Mjlab-Velocity-Flat-MicroDuck",
      "ckpt": "velocity-flat-ppo/model_6000.pt", "frames": 6, "cols": 3,
      "camera": "track", "steps": 400, "cmd": "", "parallel": True,
      "tile": {"RL_DUCK_COVER_FRACS": "0.25,0.35,0.45"}},
     {"name": "走路-v1REINFORCE", "task": "Mjlab-Velocity-Flat-MicroDuck",
-     "ckpt": "velocity-flat-reinforce/model_6000.pt", "frames": 12, "cols": 3,
+     "ckpt": "velocity-flat-reinforce/model_6000.pt", "frames": 16, "cols": 4,
      "camera": "track", "steps": 400, "cmd": "", "parallel": False,
      "keyframe_steps": 1000},
     {"name": "走路-v2A2C", "task": "Mjlab-Velocity-Flat-MicroDuck",
-     "ckpt": "velocity-flat-a2c/model_6000.pt", "frames": 12, "cols": 3,
+     "ckpt": "velocity-flat-a2c/model_6000.pt", "frames": 16, "cols": 4,
      "camera": "track", "steps": 400, "cmd": "", "parallel": False,
      "keyframe_steps": 1000},
     {"name": "轮滑", "task": "Mjlab-Velocity-Flat-MicroDuck-Rollers",
