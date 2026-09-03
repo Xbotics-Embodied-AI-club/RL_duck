@@ -65,7 +65,10 @@ KEYFRAME_SIZE = (960, 720)
 #        只会让每只都成小点（32 只那版、6 只那版都实测过）。正确的杠杆是改间距：
 #        每个环境是独立的物理世界，间距只影响画面偏移与地形分片查询，平地上纯属视觉安排。
 #        这一档用世界固定相机 + lookat 对准群体中心，lookat 在那里才真的起作用。
-PARALLEL_SPACING = 0.8
+# 六只之间的间距。**这是个取景旋钮，不是物理参数** —— 每个环境是独立的物理世界，
+# 间距只决定渲染器把它们摆多开。摆太开的后果实测过：跟拍第一只时它落在群体一端，
+# 另一端那只被画面右边切掉（外部审阅逐图抓出的就是这个）。
+PARALLEL_SPACING = float(os.environ.get('RL_DUCK_PARALLEL_SPACING') or 0.8)
 PARALLEL_ELEVATION = -22.0
 KEYFRAME_DISTANCE = 0.8
 KEYFRAME_ELEVATION = -15.0
@@ -398,14 +401,21 @@ def _as_uint8(frame) -> np.ndarray:
 
 
 def render_parallel(checkpoint: str | None = None) -> Path:
-    """渲一张「一屏一群小鸭子」的并行仿真图。
+    """渲一张「一屏一群小鸭子」的并行仿真图，外加同一段的视频。
+
+    静帧与视频要的机位不同（见函数体里 `track` 那段），所以交付时分两趟跑，
+    用 `RL_DUCK_PARALLEL_OUT` 声明这一趟只要哪个产物 —— 不分开的话后一趟会把
+    前一趟的好产物覆盖成机位不对的那版。
 
     Args:
         checkpoint: 权重路径，None 用随机策略（只验证版面）。
 
     Returns:
-        写出的 PNG 路径。
+        写出的 PNG 路径（这一趟不出 PNG 时返回视频路径）。
     """
+    want = os.environ.get("RL_DUCK_PARALLEL_OUT") or "both"
+    if want not in ("both", "still", "video"):
+        raise SystemExit(f"★ RL_DUCK_PARALLEL_OUT 只认 both/still/video，给的是 {want!r}")
     distance, azimuth, lookat = parallel_camera(PARALLEL_ENVS, checkpoint)
     # 机位可按进程钉住。自动算出来的距离是按**当前**群体外接尺寸定的，
     # 而跟拍二十秒之后各只已经散开，于是取物那档算出来的距离远到六只只剩几十像素。
@@ -414,9 +424,15 @@ def render_parallel(checkpoint: str | None = None) -> Path:
     forced_distance = os.environ.get("RL_DUCK_PARALLEL_DISTANCE")
     if forced_distance:
         distance = float(forced_distance)
-    # 交付用的六只版要跟拍。**固定机位配上统一指令会走出画面**：六只拿到同一条
+    # 交付用的六只**视频**要跟拍。**固定机位配上统一指令会走出画面**：六只拿到同一条
     # 速度指令之后整队一起走，0.5 米/秒 跑二十秒就是十米，画面里只剩空地板。
     # 跟拍第一只即可 —— 整队同速，队形不散。
+    #
+    # ⚠️ 但**静帧不能用跟拍机位**。跟拍把被跟的那只放在画面正中，而它在群体一端，
+    # 于是群体整体偏向一侧、另一端那只被画面边缘切掉 —— 外部审阅逐图抓出的就是这个。
+    # 拉远距离治不了偏心：实测三档（间距 0.8/距离 3.4、间距 0.5/距离 2.2 与 2.6）
+    # 右边那只全部照切，只是鸭子越来越小。静帧走 `parallel_camera` 量出来的世界机位，
+    # 六只居中、一只不缺。⇒ 两种产物两种机位，用 `RL_DUCK_PARALLEL_OUT` 分两趟出。
     track = bool(os.environ.get("RL_DUCK_PARALLEL_TRACK"))
     env = DuckEnv(
         num_envs=PARALLEL_ENVS,
@@ -461,15 +477,28 @@ def render_parallel(checkpoint: str | None = None) -> Path:
 
     if not frames:
         raise RuntimeError("render() 一帧都没回 —— 检查 render_mode 与 viewer 配置")
+    # 顶底那两条纯黑带静帧与视频都要削。先前只有关键帧那条路径削了，
+    # 交付图与六只视频顶底各留着一条黑杠，排进 PDF 就是图上下两道黑边。
+    # 边界只量第一帧、全段套同一个 —— 逐帧各量各的会让尺寸抖动，写不成视频。
+    top, bot, left, right = _dark_border_box(frames[0])
+    if (top, bot, left, right) != (0, frames[0].shape[0], 0, frames[0].shape[1]):
+        print(f"  削黑边：上 {top}、下 {frames[0].shape[0] - bot}、"
+              f"左 {left}、右 {frames[0].shape[1] - right} 像素")
+        frames = [f[top:bot, left:right] for f in frames]
     out = result_dir() / f"parallel-{run_label(checkpoint)}-{tag}.png"
-    # 静帧取**第一帧**而不是最后一帧：预热之后步态已经起来、六只还都在画面里；
-    # 到最后一帧它们已经各自走开，那张图只剩一半。
-    plt.imsave(out, frames[0])
     video = result_dir() / f"parallel-{run_label(checkpoint)}-{tag}.mp4"
-    media.write_video(str(video), frames, fps=fps)
     h, w = frames[0].shape[:2]
-    print(f"写出 {out} 与 {video}  ({w}×{h}，{PARALLEL_ENVS} 个环境，{len(frames)} 帧)")
-    return out
+    made = []
+    if want in ("both", "still"):
+        # 静帧取**第一帧**而不是最后一帧：预热之后步态已经起来、六只还都在画面里；
+        # 到最后一帧它们已经各自走开，那张图只剩一半。
+        plt.imsave(out, frames[0])
+        made.append(str(out))
+    if want in ("both", "video"):
+        media.write_video(str(video), frames, fps=fps)
+        made.append(str(video))
+    print(f"写出 {' 与 '.join(made)}  ({w}×{h}，{PARALLEL_ENVS} 个环境，{len(frames)} 帧)")
+    return out if want in ("both", "still") else video
 
 
 def render_keyframes(checkpoint: str | None = None) -> Path:
@@ -605,19 +634,22 @@ def _trained_keyframes(task_dir: Path) -> list[Path]:
     return [p for _n, p in sorted(numbered)]
 
 
-def _trim_dark_border(img: np.ndarray) -> np.ndarray:
-    """削掉帧四周那条纯黑带 —— 渲染缓冲区没画到的部分。
+def _dark_border_box(img: np.ndarray) -> tuple[int, int, int, int]:
+    """量出帧四周那条纯黑带的内边界 —— 渲染缓冲区没画到的部分。
 
     削多少不能写死：实测同一批帧里这条带子在不同任务上从 0 到 30 像素不等
     （走路那张顶部 30 行是精确的 0.000，旋转那张一行都没有）。写死 6 像素
     等于对一半的图没削干净，而剩下的黑边裁到边缘就成了拼图上一道黑杠。
-    所以按亮度削：从边往里，整行/整列均值低于 `_DARK_LEVEL` 就丢掉。
+    所以按亮度量：从边往里，整行/整列均值低于 `_DARK_LEVEL` 就算黑带。
+
+    返回**边界**而不是削好的帧，是为了让一段视频的每一帧削成同一个尺寸 ——
+    逐帧各量各的会让尺寸抖动，`write_video` 直接拒收。
 
     Args:
         img: (H, W, 3) 的帧。
 
     Returns:
-        削过边的帧；判不出黑边时原样返回。
+        (top, bottom, left, right)，按 `img[top:bottom, left:right]` 用。
     """
     a = img.astype(np.float32)
     if a.max() > 1.5:
@@ -637,6 +669,19 @@ def _trim_dark_border(img: np.ndarray) -> np.ndarray:
     right = w
     while right > w - cap_w and g[:, right - 1].mean() < _DARK_LEVEL:
         right -= 1
+    return top, bot, left, right
+
+
+def _trim_dark_border(img: np.ndarray) -> np.ndarray:
+    """按 `_dark_border_box` 量出的边界削一帧。
+
+    Args:
+        img: (H, W, 3) 的帧。
+
+    Returns:
+        削过边的帧；判不出黑边时原样返回。
+    """
+    top, bot, left, right = _dark_border_box(img)
     return img[top:bot, left:right]
 
 

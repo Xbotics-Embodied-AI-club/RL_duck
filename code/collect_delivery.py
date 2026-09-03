@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from env import result_base
+from paths import result_base
 from PIL import Image
 
 REPO = Path(__file__).resolve().parents[1]

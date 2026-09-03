@@ -13,7 +13,6 @@ actor 和 critic 各自那一份。三个训练版本共用本文件，对照时
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
 # 导入即注册：这一行执行 mjlab_microduck 里所有 register_mjlab_task(...) 调用，
@@ -23,6 +22,11 @@ import mjlab_microduck.tasks  # noqa: F401
 import torch
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg
+
+# 从 paths 转出口：`result_base` 本身不碰仿真器，住在 paths.py 里让**收件**
+# 能在没装仿真器的机器上跑；这里再导一次，是为了 `from env import result_base`
+# 这个既有入口不变（出图那几个脚本都从这里取）。
+from paths import result_base  # noqa: F401
 
 # ============================ 这一轮跑什么 ============================
 # 全仓唯一的任务声明处。改这一行就是换一个动作；结果目录与权重目录都从它派生，
@@ -121,22 +125,6 @@ def split_actor_critic_obs(obs):
     """
     actor_obs = obs["actor"] if "actor" in obs else obs["policy"]
     return actor_obs, obs["critic"]
-
-
-def result_base() -> Path:
-    """过程产物的根目录。
-
-    默认是仓内的 `result/`（独立克隆下来的人跑一下就有东西看）；
-    本仓库把它指到仓外，理由是 `rl_duck/` 这个目录本身就是交付物 ——
-    交付物里不该混着几百兆的中间件。用 `RL_DUCK_RESULT_ROOT` 覆盖。
-
-    Returns:
-        过程产物根目录的绝对路径（已建好）。
-    """
-    override = os.environ.get("RL_DUCK_RESULT_ROOT")
-    base = Path(override) if override else Path(__file__).resolve().parents[1] / "result"
-    base.mkdir(parents=True, exist_ok=True)
-    return base
 
 
 class DuckEnv:

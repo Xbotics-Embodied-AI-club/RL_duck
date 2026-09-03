@@ -65,9 +65,14 @@ JOBS: tuple[dict, ...] = (
 )
 
 CODE = Path(__file__).resolve().parent
-# 六只版：跟拍第一只 + 统一指令（整队才不散）+ 机位钉在 1.8 米。
-PARALLEL_ENV = {"RL_DUCK_PARALLEL_TRACK": "1", "RL_DUCK_PARALLEL_RECORD": "400",
-                "RL_DUCK_PARALLEL_DISTANCE": "1.8"}
+# 六只版的**视频**：跟拍第一只 + 统一指令（整队才不散）+ 机位钉在 1.8 米。
+PARALLEL_VIDEO_ENV = {"RL_DUCK_PARALLEL_TRACK": "1", "RL_DUCK_PARALLEL_RECORD": "400",
+                      "RL_DUCK_PARALLEL_DISTANCE": "1.8", "RL_DUCK_PARALLEL_OUT": "video"}
+# 六只版的**静帧**要另一套机位：跟拍把被跟的那只摆在正中，而它在群体一端，
+# 于是另一端那只被画面切掉（外部审阅逐图抓出的就是这个，拉距离治不了偏心）。
+# 静帧走 `parallel_camera` 量出来的世界机位 —— 不给 TRACK、不给 DISTANCE、
+# 也不钉指令，让它按实测的群体中心与跨度取景。只要第一帧，录 2 帧就够。
+PARALLEL_STILL_ENV = {"RL_DUCK_PARALLEL_RECORD": "2", "RL_DUCK_PARALLEL_OUT": "still"}
 
 
 def ckpt_root() -> Path:
@@ -124,8 +129,14 @@ def do_job(job: dict) -> None:
     run_step("render_gallery.py", {**base, "RL_DUCK_ONLY": "keyframes"},
              f"{job['name']}：关键帧 {job['frames']} 帧 {job['cols']} 列")
     if job["parallel"]:
-        run_step("render_gallery.py", {**base, **PARALLEL_ENV, "RL_DUCK_ONLY": "parallel"},
-                 f"{job['name']}：六只版并行图与视频")
+        run_step("render_gallery.py",
+                 {**base, **PARALLEL_VIDEO_ENV, "RL_DUCK_ONLY": "parallel"},
+                 f"{job['name']}：六只版视频（跟拍机位）")
+        # 静帧那趟要把钉住的指令也去掉：钉了指令六只整队走，第一帧就已经偏出中心。
+        still = {k: v for k, v in base.items() if k != "RL_DUCK_FORCE_CMD"}
+        run_step("render_gallery.py",
+                 {**still, **PARALLEL_STILL_ENV, "RL_DUCK_ONLY": "parallel"},
+                 f"{job['name']}：六只版静帧（世界机位，群体居中）")
     video_env = {**base, "RL_DUCK_RUN_NAME": f"交付-{job['name']}",
                  "RL_DUCK_VIDEO_STEPS": str(job["steps"])}
     if job["camera"] == "fixed":
