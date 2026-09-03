@@ -76,8 +76,17 @@ def use_project_font():
             f"当前值 = {path!r}"
         )
     font_manager.fontManager.addfont(path)
-    plt.rcParams["font.family"] = font_manager.FontProperties(fname=path).get_name()
+    family = font_manager.FontProperties(fname=path).get_name()
+    plt.rcParams["font.family"] = family
     plt.rcParams["axes.unicode_minus"] = False
+# **数学符号用 STIX。** 两件事分开看：
+    # ① `font.family` 管不到 `$...$` —— mathtext 默认走 DejaVu，图上的 $a_t$
+    #    与周围的宋体/Times 正文不是一套字；
+    # ② 把 mathtext 指到这份合并体（custom）能让字形对上，但那份字体没有斜体面，
+    #    变量会渲成**直立**的，而 PDF 正文里 xelatex 把 $a_t$ 渲成斜体 —— 两边又不一致。
+    # STIX 是按 Times 度量设计的数学字体，斜体、字重、笔画粗细都与 Times 正文匹配，
+    # 是这类"中文正文 + Times 西文 + 行内公式"排版的标准解。
+    plt.rcParams["mathtext.fontset"] = "stix"
 
 
 def read_metrics(run_dir: Path) -> tuple[np.ndarray, np.ndarray]:
