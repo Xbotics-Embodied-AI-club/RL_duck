@@ -21,8 +21,11 @@ from PIL import Image
 
 REPO = Path(__file__).resolve().parents[1]
 DELIVERY = REPO / "交付"
+# 讲义正文引用的图落在 docs 里，与讲义同处 —— 交付目录只放视频与权重，
+# 讲义与图不在那里再出现一份（一份东西两个位置，改一处忘一处只是时间问题）。
+FIGURE_DIR = REPO / "docs/assets/figures"
 
-# 讲义正文引用的图。左边是过程产物里的相对路径，右边是交付名。
+# 讲义正文引用的图。左边是过程产物里的相对路径，右边是 `docs/assets/figures/` 下的名字。
 # **正文里的图引用只认右边这一列** —— 换了权重档就改这里，正文一个字都不用动。
 FIGURES: tuple[tuple[str, str], ...] = (
     ("cover.png", "00-开篇动作带.png"),
@@ -119,7 +122,7 @@ def main() -> None:
     """
     print(f"过程产物根：{result_base()}")
     print("图：")
-    missing = copy_set(FIGURES, DELIVERY / "图")
+    missing = copy_set(FIGURES, FIGURE_DIR)
     print("视频：")
     missing += copy_set(VIDEOS, DELIVERY / "视频")
     if missing:
@@ -127,7 +130,8 @@ def main() -> None:
         for m in missing:
             print(f"    {m}", file=sys.stderr)
         raise SystemExit(1)
-    print(f"齐了：{len(FIGURES)} 张图、{len(VIDEOS)} 段视频 -> {DELIVERY}")
+    print(f"齐了：{len(FIGURES)} 张图 -> {FIGURE_DIR}，"
+          f"{len(VIDEOS)} 段视频 -> {DELIVERY / '视频'}")
 
 
 if __name__ == "__main__":
