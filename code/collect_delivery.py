@@ -15,7 +15,9 @@ import shutil
 import sys
 from pathlib import Path
 
+import numpy as np
 from env import result_base
+from PIL import Image
 
 REPO = Path(__file__).resolve().parents[1]
 DELIVERY = REPO / "交付"
@@ -55,6 +57,35 @@ VIDEOS: tuple[tuple[str, str], ...] = (
 )
 
 
+# 白边的判据与边距（bd xb-h26t）：非白像素包围盒，阈值 248、留 20 像素。
+_WHITE_LEVEL = 248
+_WHITE_PAD = 20
+
+
+def crop_white_border(src: Path, dst: Path) -> None:
+    """把图四周的白边裁掉再写到交付目录。
+
+    为什么要裁：matplotlib 的画布按格子数算高，帧是 4:3 时每格上下都富余，
+    出来的 PNG 纵向留白能占到 22%（实测 `keyframes-iter2000.png`）。
+    排版上这条留白表现为"图与图注之间空一大条"，而**收 width% 治不了它** ——
+    等比缩放留白跟着缩，相对位置一点不变。
+
+    Args:
+        src: 过程产物里的原图。
+        dst: 交付目录里的目标路径。
+    """
+    img = Image.open(src).convert("RGB")
+    mask = (np.asarray(img) < _WHITE_LEVEL).any(axis=2)
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        shutil.copy2(src, dst)
+        return
+    h, w = mask.shape
+    box = (max(int(xs.min()) - _WHITE_PAD, 0), max(int(ys.min()) - _WHITE_PAD, 0),
+           min(int(xs.max()) + 1 + _WHITE_PAD, w), min(int(ys.max()) + 1 + _WHITE_PAD, h))
+    img.crop(box).save(dst)
+
+
 def copy_set(pairs: tuple[tuple[str, str], ...], out_dir: Path) -> list[str]:
     """按声明拷一组文件，返回缺失的源文件清单。
 
@@ -72,7 +103,10 @@ def copy_set(pairs: tuple[tuple[str, str], ...], out_dir: Path) -> list[str]:
         if not src.is_file():
             missing.append(src_rel)
             continue
-        shutil.copy2(src, out_dir / dst_name)
+        if src.suffix.lower() == ".png":
+            crop_white_border(src, out_dir / dst_name)
+        else:
+            shutil.copy2(src, out_dir / dst_name)
         print(f"  {src_rel}  ->  {dst_name}")
     return missing
 

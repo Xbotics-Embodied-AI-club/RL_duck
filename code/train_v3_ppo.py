@@ -704,7 +704,10 @@ def main():
         seed=SEED,
         max_iterations=MAX_ITERATIONS,
         num_steps_per_env=24,
-        save_interval=200,
+        # 存盘间隔可按进程覆盖。默认 200 是给完整训练用的；
+        # 而"进化视频"要的是**最早那两百次迭代**里的样子 ——
+        # 学会站、学会迈第一步全发生在那段，200 这个间隔一张都没留下。
+        save_interval=int(os.environ.get("RL_DUCK_SAVE_INTERVAL") or 200),
         device="cuda:0",
         wandb_project="rl_duck",
         wandb_mode="offline",

@@ -103,6 +103,8 @@ KEYFRAME_COLS = int(os.environ.get("RL_DUCK_KEYFRAME_COLS") or 3)
 # 采样窗口长度。可按进程覆盖：判「摔没摔」要覆盖整个回合（走路那档 1000 步），
 # 而讲义里展示动作用的是 260 步这档窗口 —— 两种用途要的窗口长度不一样。
 KEYFRAME_STEPS = int(os.environ.get('RL_DUCK_KEYFRAME_STEPS') or 260)
+# 有没有显式给过窗口长度 —— 短回合任务只在给过的时候才截短。
+_STEPS_GIVEN = bool(os.environ.get('RL_DUCK_KEYFRAME_STEPS'))
 KEYFRAME_SKIP = 60
 # 判定"这是 episodic 任务还是周期性任务"的阈值，单位是**秒**。
 # 它必须与 KEYFRAME_STEPS 分开，而且不能用步数表达 —— 两条都是实测踩出来的：
@@ -313,7 +315,10 @@ def keyframe_window(env: DuckEnv) -> tuple[int, int]:
         (跳过多少步, 总共跑多少步)。
     """
     if env.episode_seconds <= EPISODIC_THRESHOLD_SECONDS:
-        return 0, env.episode_steps
+        # 短回合默认整段看完；给了 `RL_DUCK_KEYFRAME_STEPS` 就当上界用 ——
+        # 想只看回合的前一段时（比如动作在第 68 步就完成、后面是另一回事），
+        # 得有办法把窗口截短，而不是被迫连回合最后一帧一起摆上去。
+        return 0, min(env.episode_steps, KEYFRAME_STEPS) if _STEPS_GIVEN else env.episode_steps
     return KEYFRAME_SKIP, KEYFRAME_STEPS
 
 
@@ -507,8 +512,15 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
     # 实测第一版 PDF 的取物那张就是这样 —— 图在、看不清，等于没有。
     # 两行三列把宽高比压到 1.3:1，每帧的线性尺寸大 67%、面积近三倍。
     rows = -(-KEYFRAME_COUNT // KEYFRAME_COLS)
+    # **每格的高度要按帧的宽高比算，不能写死。** 先前写的是每行 3.4 英寸，
+    # 而帧是 4:3、格宽 3.0 英寸 ⇒ 图只占 2.25 英寸高，剩下 1.15 英寸是空白，
+    # 十六帧那张在纸上就是四条和图一样高的白带，鸭子却小得看不清姿态。
+    # 现在按帧的实际宽高比定行高，再加上步号那行字的高度。
+    frame_h, frame_w = strip[0].shape[:2]
+    cell_w = 3.6
     fig, axes = plt.subplots(rows, KEYFRAME_COLS,
-                             figsize=(3.0 * KEYFRAME_COLS, 3.4 * rows), dpi=200)
+                             figsize=(cell_w * KEYFRAME_COLS,
+                                      (cell_w * frame_h / frame_w + 0.28) * rows), dpi=200)
     flat = np.atleast_1d(axes).ravel()
     for ax, img, idx in zip(flat, strip, picks, strict=False):
         ax.imshow(img)
@@ -521,6 +533,10 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
     # 不加 suptitle：任务名在讲义的图题里已经写了，图上再印一遍英文 task id
     # 是给中文读者添一层要忽略的东西。
     fig.tight_layout()
+    # 行间还要再收一次。按帧宽高比算完行高之后，每行仍留了一点给步号那行字，
+    # imshow 保持等比、图在格子里居中 ⇒ 富余的高度一半跑到图上方去了，
+    # 表现为行与行之间一条空带。hspace 收掉它。
+    fig.subplots_adjust(hspace=0.02)
     out = result_dir() / f"keyframes-{tag}.png"
     fig.savefig(out)
     plt.close(fig)

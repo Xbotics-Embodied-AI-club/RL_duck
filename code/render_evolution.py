@@ -34,9 +34,12 @@ from rollout import load_policy
 # 一段视频里放几档权重，以及每档跑多少步（50 Hz，150 步 = 3 秒）。
 STAGES = int(os.environ.get("RL_DUCK_EVO_STAGES") or 6)
 STEPS = int(os.environ.get("RL_DUCK_EVO_STEPS") or 150)
-# 取景与交付视频保持一致，两者才对得上。
+# **这段视频必须用固定机位。** 跟拍机位下镜头锁在鸭子身上、地板又是无特征的格子，
+# 走得再远也像原地踏步 —— 轮滑那段视频已经栽过一次（实测 5 秒走 1.553 米，
+# 录出来看着没动）。而这段片子要给人看的恰恰是"越练走得越远"，
+# 位移看不见，这段片子就没有意义。
 SIZE = (1280, 960)
-DISTANCE = 0.9
+DISTANCE = float(os.environ.get("RL_DUCK_EVO_DISTANCE") or 2.6)
 ELEVATION = -15.0
 LABEL_PX = 44
 
@@ -127,6 +130,16 @@ def main() -> None:
     # 那时它已经会站了 —— 少了这一段，整条视频看下来"进化"并不明显，
     # 而随机策略那三秒是全片对比最强的一段。
     stages.insert(0, (0, None))
+    # 末尾再接一档**别的 run** 的权重。为什么需要跨 run：进步全发生在前几百次迭代里，
+    # 而正式训练每 200 次才存一档 —— 那一段一张都没留下。于是单独跑了一次只训 400 次、
+    # 每 10 次存一档的短训练（`RL_DUCK_SAVE_INTERVAL`）当前半段，
+    # 收尾那一档仍取正式训练的最终权重，让"练到头是什么样"也在片子里。
+    final = os.environ.get("RL_DUCK_EVO_FINAL")
+    if final:
+        m = re.fullmatch(r"model_(\d+)", Path(final).stem)
+        if not m:
+            raise SystemExit(f"★ RL_DUCK_EVO_FINAL 的文件名里读不出迭代数：{final}")
+        stages.append((int(m.group(1)), Path(final)))
     print("这段视频要接的档：", ", ".join(str(i) for i, _ in stages))
 
     frames: list[np.ndarray] = []
@@ -134,7 +147,7 @@ def main() -> None:
     for iteration, ckpt in stages:
         env = DuckEnv(num_envs=1, device="cuda:0", seed=1, render_mode="rgb_array",
                       shadows=False, render_size=SIZE, camera_distance=DISTANCE,
-                      camera_elevation=ELEVATION, camera_origin="asset_root",
+                      camera_elevation=ELEVATION, camera_origin="world",
                       debug_vis=False)
         try:
             model = (make_policy(env, None)[0] if ckpt is None
