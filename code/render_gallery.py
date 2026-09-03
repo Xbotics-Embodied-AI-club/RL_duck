@@ -30,12 +30,13 @@ import matplotlib
 import mediapy as media
 import numpy as np
 import torch
+from PIL import Image, ImageDraw, ImageFont
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import TASK, DuckEnv, task_slug
+from env import TASK, DuckEnv, result_base, task_slug
 from model import ActorCritic
 from plot_reward_curves import use_project_font
 from rollout import align_curriculum, check_task_match, load_policy
@@ -83,7 +84,8 @@ PARALLEL_ENVS = 6
 # 那段 mp4 只当"很多只在各自跑"的动态素材，不要求全程六只都在框内。
 # 要一段全程满画面的视频就把它改成 200。
 PARALLEL_PREROLL = 12
-PARALLEL_RECORD = 1000
+# 录多少帧。交付用的六只版按需缩短：整队一起走的话二十秒会走出十米。
+PARALLEL_RECORD = int(os.environ.get('RL_DUCK_PARALLEL_RECORD') or 1000)
 
 # 关键帧序列：横排几帧。取帧的**窗口**不是常量，按任务的回合长度算（见 keyframe_window）。
 # 取 6 帧、排成两行三列（见 render_keyframes 里为什么不横排一行）。
@@ -98,7 +100,9 @@ _DEFAULT_KEYFRAME_COUNT = 6
 KEYFRAME_COUNT = int(os.environ.get("RL_DUCK_KEYFRAME_COUNT") or _DEFAULT_KEYFRAME_COUNT)
 KEYFRAME_COLS = int(os.environ.get("RL_DUCK_KEYFRAME_COLS") or 3)
 # 长回合、周期性动作（走路）的取帧窗口：跳掉启动瞬态，再取一段。
-KEYFRAME_STEPS = 260
+# 采样窗口长度。可按进程覆盖：判「摔没摔」要覆盖整个回合（走路那档 1000 步），
+# 而讲义里展示动作用的是 260 步这档窗口 —— 两种用途要的窗口长度不一样。
+KEYFRAME_STEPS = int(os.environ.get('RL_DUCK_KEYFRAME_STEPS') or 260)
 KEYFRAME_SKIP = 60
 # 判定"这是 episodic 任务还是周期性任务"的阈值，单位是**秒**。
 # 它必须与 KEYFRAME_STEPS 分开，而且不能用步数表达 —— 两条都是实测踩出来的：
@@ -129,10 +133,46 @@ COVER_LAYOUT = (
     ("velocity-flat-rollers", "轮滑"),
     ("spin-flat", "原地旋转"),
     ("groundpick-flat", "嘴尖取物"),
-    ("rollercrouch-flat", "蹲姿滑行"),
     ("roulade-flat", "前滚翻"),
 )
 COVER_COLUMNS = 3
+# 动作带的版面：一行一个动作，行内三张是同一个动作的三个瞬间。
+# 左边留一条写动作名的空白，图上不烧任何字。
+_COVER_TILE_PX = (560, 420)
+_COVER_LABEL_PX = 280
+_COVER_GUTTER_PX = 10
+# 开篇拼图每格的候选取样点（占回合的比例）。开头是启动瞬态、末尾常常已经倒了，
+# 所以只在中间那段里取；一个动作在回合里反复出现，不同相位看着差别很大，
+# 所以多给几张让人挑，而不是让脚本替人决定哪张"典型"。
+# crop_to_content 的两个量：池化块边长、以及算作有内容的亮度阈值。
+# 块取 12：格线约 1–2 像素宽，在 12×12 块里被摊薄到阈值以下；再大会把鸭子细部也摊掉。
+# 开篇定格的机位距离（米）。比 KEYFRAME_DISTANCE 远，为的是构图留白。
+_COVER_TILE_DISTANCE = 0.95
+
+_BLOCK = 12
+# 帧边缘那条**纯黑**带（渲染缓冲区没画到的部分）：实测是精确的 0.000，
+# 而地板最暗处 0.246 —— 0.05 这条线中间空着五倍余量，不是猜的。
+_DARK_LEVEL = 0.05
+# 最多削掉一条边的这个比例，免得判据出错时把整张图削光。
+# **0.15 太紧**：实测帧顶那条黑带占 16–17%，卡在上限上削不完，留下一条更细的黑边 ——
+# 比不削更难看，因为看上去像是故意留的。0.30 仍然安全：地板最暗处 0.246，
+# 离 0.05 那条线差着五倍，不存在把地板当黑边削掉的可能。
+_DARK_MAX_FRAC = 0.30
+# 阈值 0.6 是量出来的，不是猜的：在一张定格上按 8/12/16 三种块大小扫过
+# 0.45 / 0.55 / 0.6 / 0.7 四档，0.45 时命中块横跨整幅 65 行里的 2–64 行
+# （地板格线被算成了内容），0.6 收到 2–32 行 —— 那才是鸭子占的那一块。
+_CONTENT_LEVEL = 0.6
+# 主体到裁框上下沿至少留主体高度的这个比例 —— 别让头顶到边。
+_MIN_HEADROOM = 0.22
+# 裁框至少保留原图高度的这个比例 —— 免得裁出一张分辨率不够的小图。
+_MIN_KEEP = 0.62
+
+_COVER_TILE_FRACS = tuple(
+    float(x) for x in os.environ.get("RL_DUCK_COVER_FRACS", "0.25,0.35,0.45,0.55,0.65,0.75").split(",")
+)
+# ⚠️ 默认那组只覆盖回合的中后段，**对"动作发生在很早"的任务是盲的**：
+# 前滚翻整个翻滚在第 0–68 步就完成了，而回合有 250 步 —— 0.25 已经是第 62 步之后，
+# 六张候选没有一张拍到倒立那一刻。这类任务要用 RL_DUCK_COVER_FRACS 显式往前挪。
 # ==============================================================
 
 
@@ -246,7 +286,7 @@ def result_dir(slug: str | None = None) -> Path:
     Returns:
         `result/<slug>/` 的绝对路径，已建好。
     """
-    d = Path(__file__).resolve().parents[1] / "result" / (slug or task_slug())
+    d = result_base() / (slug or task_slug())
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -332,6 +372,17 @@ def render_parallel(checkpoint: str | None = None) -> Path:
         写出的 PNG 路径。
     """
     distance, azimuth, lookat = parallel_camera(PARALLEL_ENVS, checkpoint)
+    # 机位可按进程钉住。自动算出来的距离是按**当前**群体外接尺寸定的，
+    # 而跟拍二十秒之后各只已经散开，于是取物那档算出来的距离远到六只只剩几十像素。
+    # 交付用的六只版直接给一个固定距离：散出画面的那只就让它出去，
+    # 留在画面里的那几只要看得清。
+    forced_distance = os.environ.get("RL_DUCK_PARALLEL_DISTANCE")
+    if forced_distance:
+        distance = float(forced_distance)
+    # 交付用的六只版要跟拍。**固定机位配上统一指令会走出画面**：六只拿到同一条
+    # 速度指令之后整队一起走，0.5 米/秒 跑二十秒就是十米，画面里只剩空地板。
+    # 跟拍第一只即可 —— 整队同速，队形不散。
+    track = bool(os.environ.get("RL_DUCK_PARALLEL_TRACK"))
     env = DuckEnv(
         num_envs=PARALLEL_ENVS,
         device="cuda:0",
@@ -343,12 +394,14 @@ def render_parallel(checkpoint: str | None = None) -> Path:
         # 用世界固定相机对准群体中心，而不是跟拍某一只：跟拍会把被跟的那只放在
         # 画面正中，而它在群体的一端，于是其余五只全挤到一侧。群体中心 160 步只漂
         # 13 厘米，固定机位足够稳。
-        camera_origin="world",
+        camera_origin="asset_root" if track else "world",
+        debug_vis=False,  # 同上
         render_size=PARALLEL_SIZE,
         camera_distance=distance,
         camera_elevation=PARALLEL_ELEVATION,
         camera_azimuth=azimuth,
-        camera_lookat=lookat,
+        # lookat 只在自由相机下生效，跟拍模式传它会被 DuckEnv 拒掉。
+        camera_lookat=None if track else lookat,
     )
     frames: list[np.ndarray] = []
     try:
@@ -409,6 +462,7 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
         # 画面恰好也对 —— 于是"取景到底是我们定的还是撞上的"分不出来。
         # 一份教学材料里，参数生效与不生效必须看得出来。
         camera_origin="asset_root",
+        debug_vis=False,  # 关掉指令箭头，见 env.py 那段注释
     )
     frames: list[np.ndarray] = []
     try:
@@ -441,7 +495,10 @@ def render_keyframes(checkpoint: str | None = None) -> Path:
         print(f"⚠ 只渲到 {len(frames)} 帧，不够跳过 {skip} 帧 —— 改为从第 0 帧取，步号跟着改")
     usable = frames[offset:]
     picks = np.linspace(0, len(usable) - 1, KEYFRAME_COUNT).round().astype(int)
-    strip = [usable[i] for i in picks]
+    # 每帧先削掉那条纯黑带。**这条不能只在 `crop_to_content` 里做** ——
+    # 关键帧这条路根本不裁图（六帧要保持同一取景才比得出动作变化），
+    # 于是先前只有开篇拼图干净、讲义里八张关键帧图每格顶上都留着一道黑带。
+    strip = [_trim_dark_border(usable[i]) for i in picks]
 
     use_project_font()
     # 排成 KEYFRAME_COLS 列的网格，**不是一行横排**。
@@ -501,6 +558,119 @@ def _trained_keyframes(task_dir: Path) -> list[Path]:
     return [p for _n, p in sorted(numbered)]
 
 
+def _trim_dark_border(img: np.ndarray) -> np.ndarray:
+    """削掉帧四周那条纯黑带 —— 渲染缓冲区没画到的部分。
+
+    削多少不能写死：实测同一批帧里这条带子在不同任务上从 0 到 30 像素不等
+    （走路那张顶部 30 行是精确的 0.000，旋转那张一行都没有）。写死 6 像素
+    等于对一半的图没削干净，而剩下的黑边裁到边缘就成了拼图上一道黑杠。
+    所以按亮度削：从边往里，整行/整列均值低于 `_DARK_LEVEL` 就丢掉。
+
+    Args:
+        img: (H, W, 3) 的帧。
+
+    Returns:
+        削过边的帧；判不出黑边时原样返回。
+    """
+    a = img.astype(np.float32)
+    if a.max() > 1.5:
+        a = a / 255.0
+    g = a.mean(axis=2)
+    h, w = g.shape
+    cap_h, cap_w = int(h * _DARK_MAX_FRAC), int(w * _DARK_MAX_FRAC)
+    top = 0
+    while top < cap_h and g[top].mean() < _DARK_LEVEL:
+        top += 1
+    bot = h
+    while bot > h - cap_h and g[bot - 1].mean() < _DARK_LEVEL:
+        bot -= 1
+    left = 0
+    while left < cap_w and g[:, left].mean() < _DARK_LEVEL:
+        left += 1
+    right = w
+    while right > w - cap_w and g[:, right - 1].mean() < _DARK_LEVEL:
+        right -= 1
+    return img[top:bot, left:right]
+
+
+def crop_to_content(img: np.ndarray, margin_frac: float = 0.06,
+                    aspect: float | None = None) -> np.ndarray:
+    """裁掉没有信息的边，并把主体**放到画面正中**。
+
+    两件事都是踩出来的：
+
+    · **判据要按「块」而不是按像素。** 地板上那些白色格线的三通道最小值也很高，
+      按像素找包围盒时它们横贯整幅、纵贯整幅 —— 包围盒等于整张图，等于没裁。
+      先把亮度图按 `_BLOCK` 做均值池化再判：一条两像素宽的线在 8×8 的块里只占
+      四分之一权重，均值掉到阈值以下；鸭子是一整块实心的白，均值仍然高。
+    · **裁完要以主体为中心。** 只按包围盒加等比边距，主体在原图哪个位置就还在哪个位置 ——
+      实测走路那张的鸭子在左上角，裁完仍在左上角。所以最后一步是：取包围盒中心，
+      按目标尺寸对称地往两边扩。
+
+    Args:
+        img: (H, W, 3) 的帧。
+        margin_frac: 主体包围盒之外留多少（按包围盒边长的比例）。
+        aspect: 想要的宽高比；给 None 就沿用原图的宽高比。
+
+    Returns:
+        裁过的帧；判不出主体时原样返回（宁可不裁，也不要裁出一张空图）。
+    """
+    img = _trim_dark_border(img)
+    a = img.astype(np.float32)
+    if a.max() > 1.5:
+        a = a / 255.0
+    lum = a.min(axis=2)          # 白/灰的机器人三通道都高；饱和色的调试箭头与暗地板都低
+    h, w = lum.shape
+    bh, bw = h // _BLOCK, w // _BLOCK
+    if bh < 4 or bw < 4:
+        return img
+    pooled = lum[: bh * _BLOCK, : bw * _BLOCK].reshape(bh, _BLOCK, bw, _BLOCK).mean(axis=(1, 3))
+    mask = pooled > _CONTENT_LEVEL
+    if mask.sum() < 4:
+        return img
+    rows, cols = np.where(mask.any(axis=1))[0], np.where(mask.any(axis=0))[0]
+    y0, y1 = rows[0] * _BLOCK, (rows[-1] + 1) * _BLOCK
+    x0, x1 = cols[0] * _BLOCK, (cols[-1] + 1) * _BLOCK
+
+    # 以主体中心为中心，按目标宽高比取一个尽量大的框
+    cy, cx = (y0 + y1) / 2, (x0 + x1) / 2
+    want_h = (y1 - y0) * (1 + 2 * margin_frac)
+    want_w = (x1 - x0) * (1 + 2 * margin_frac)
+    ar = aspect if aspect else w / h
+    want_w = max(want_w, want_h * ar)
+    want_h = want_w / ar
+    # 贴边时**整体缩小**，不能把某一边切齐主体 —— 那就成了"头顶到画面上沿"。
+    # 先算四个方向各自还能扩多远，取最紧的那个当半高/半宽。
+    half_h = min(want_h / 2, cy, h - cy)
+    half_w = min(want_w / 2, cx, w - cx)
+    half_h = min(half_h, half_w / ar)
+    half_w = half_h * ar
+    # 主体到裁框上/下沿至少要留这么多（按主体高度的比例）。留不出来就把框再缩，
+    # 缩到主体本身放不下时才放弃 —— 那说明原图机位就太近，该退远重渲。
+    need = (y1 - y0) * _MIN_HEADROOM
+    if half_h < (y1 - y0) / 2 + need:
+        half_h = min((y1 - y0) / 2 + need, cy, h - cy)
+        half_w = half_h * ar
+        if half_w > min(cx, w - cx):
+            half_w = min(cx, w - cx)
+            half_h = half_w / ar
+    yy0, yy1 = int(round(cy - half_h)), int(round(cy + half_h))
+    xx0, xx1 = int(round(cx - half_w)), int(round(cx + half_w))
+    if yy1 - yy0 < 32 or xx1 - xx0 < 32:
+        return img
+    # **裁出来的图不能太小。** 相机退远之后鸭子在原图里占得少，紧贴主体去裁会得到
+    # 一张两百来像素的小图 —— 放进拼图再放大就是一团糊。裁框不小于原图高度的
+    # `_MIN_KEEP`，宁可多留一点地板，也不要分辨率不够。
+    min_h = int(h * _MIN_KEEP)
+    if yy1 - yy0 < min_h:
+        half_h = min(min_h / 2, cy, h - cy)
+        half_w = min(half_h * ar, cx, w - cx)
+        half_h = half_w / ar
+        yy0, yy1 = int(round(cy - half_h)), int(round(cy + half_h))
+        xx0, xx1 = int(round(cx - half_w)), int(round(cx + half_w))
+    return img[yy0:yy1, xx0:xx1]
+
+
 def _latest_parallel(task_dir: Path) -> Path | None:
     """某个任务最新那张并行仿真图，按迭代号数值排序。
 
@@ -523,53 +693,130 @@ def _latest_parallel(task_dir: Path) -> Path | None:
     return max(numbered)[1] if numbered else None
 
 
+def render_cover_tile(checkpoint: str | None = None) -> Path:
+    """渲一张**单只**鸭子的定格，专供开篇拼图用。
+
+    为什么不复用别的两类图：并行图是六只、缩到拼图的一格里每只只剩几十像素；
+    关键帧是一张 2×3 的拼版，再拼进拼图就成了"拼图的拼图"。
+    开篇那张要的是"一个动作一眼认得出"，所以每格该是**一只鸭子的一帧**。
+
+    取哪几帧：`_COVER_TILE_FRACS` 里的每个相位各一张，全部写出来当候选。
+    只取一帧是碰运气 —— 那一刻可能正好在腾空、在侧身；一个动作在回合里反复出现，
+    不同相位差别很大，机器挑不出"典型"，人一眼就能挑。
+
+    Args:
+        checkpoint: 权重路径，None 用随机策略（只验证版面）。
+
+    Returns:
+        写出的 PNG 路径。
+    """
+    # 机位可按进程覆盖。**默认那个正面机位对"姿态类"动作是不够的**：
+    # 轮滑与蹲姿滑行从正面看几乎一样（都是直立朝镜头），而两者的差别全在腿的弯曲程度上 ——
+    # 那要从侧面才看得出来。RL_DUCK_COVER_AZIMUTH 就是为这种情况留的。
+    azimuth = os.environ.get("RL_DUCK_COVER_AZIMUTH")
+    # 定格的机位比关键帧那档**退远一些**（0.8 → 0.95 米）。
+    # 理由是构图不能靠裁来救：跟拍相机对准的是髋部，而头在髋部之上 ——
+    # 用 0.8 米拍出来鸭子顶着画面上沿，裁的时候上方根本没有余量可留，
+    # 只能把头贴着边切出去。先在原图里留出空间，裁才有得选。
+    # 退到 1.2 米又过了头：鸭子在原图里太小，紧贴主体裁出来只有两百来像素 ——
+    # 0.95 米配 `crop_to_content` 的 `_MIN_KEEP` 下限，两头都够。
+    env = DuckEnv(
+        num_envs=1, device="cuda:0", seed=1, render_mode="rgb_array", shadows=False,
+        render_size=KEYFRAME_SIZE, camera_distance=_COVER_TILE_DISTANCE,
+        camera_elevation=KEYFRAME_ELEVATION, camera_origin="asset_root",
+        camera_azimuth=float(azimuth) if azimuth else None,
+        debug_vis=False,  # 关掉指令箭头，见 env.py 那段注释
+    )
+    frames: list[np.ndarray] = []
+    try:
+        model, tag = make_policy(env, checkpoint)
+        skip, steps = keyframe_window(env)
+        obs, _critic = env.reset()
+        for _ in range(steps):
+            with torch.no_grad():
+                actions = model.act_inference(obs)
+            obs, _critic, _r, _d, _i = env.step(actions)
+            rendered = env.render()
+            if rendered is not None:
+                frames.append(_as_uint8(rendered))
+    finally:
+        env.close()
+    if not frames:
+        raise RuntimeError("render() 一帧都没回 —— 检查 render_mode 与 viewer 配置")
+    usable = frames[skip:] if len(frames) > skip else frames
+    # **多存几张候选，让人挑。** 只取中段那一帧是碰运气：那一刻可能正好在腾空、
+    # 在侧身、或者刚被推了一下 —— 而开篇拼图要的是"这个动作最典型的样子"。
+    # 一个动作在回合里反复出现，不同相位差别很大，机器挑不出"典型"，人一眼就能挑。
+    out = None
+    for frac in _COVER_TILE_FRACS:
+        pick = usable[min(int(len(usable) * frac), len(usable) - 1)]
+        cand = result_dir() / f"cover-cand-{tag}-{int(frac * 100):02d}.png"
+        media.write_image(cand, crop_to_content(pick, margin_frac=0.10, aspect=4 / 3))
+        out = out or cand
+    print(f"写出 {len(_COVER_TILE_FRACS)} 张候选到 {result_dir()}/cover-cand-{tag}-*.png"
+          f" —— build_cover 会按相位编号取前 {COVER_COLUMNS} 张排成一行")
+    return out
+
+
 def build_cover() -> Path | None:
-    """把各动作已渲好的**并行仿真图**摆成开篇那张拼图。
+    """把每个动作的三个瞬间摆成开篇那条**动作带**：一行一个动作，行内三张按时间排。
 
-    只读已有的 PNG，不重新渲 —— 所以它可以在每训完一个动作之后重跑一次，
-    格子会一个个填上。
+    为什么一行三张、而不是一格一张：一格一张只证明"这一刻它站着"。
+    走路要看两条腿在换、前滚翻要看从起手到落地 —— 动作是**过程**，
+    一张定格拍不出过程，三张连起来一眼就看出来了。
 
-    **用并行图而不是关键帧拼版**：关键帧本身就是一张 2×3 的拼版，再把六张拼版
-    拼成一张，就成了"拼图的拼图" —— 实测那样每只鸭子只剩四十来像素，
-    开篇第一张图什么都看不清。并行图是单张场景、本来就撑得住缩小，
-    而且六只一起出现比单只更有开篇该有的分量。
+    动作名写在左边的空白里，不烧到图上：图上一有字，排版换了、措辞改了都动不了它，
+    而且与正文的图题重复。
+
+    取图顺序按候选的相位编号（`cover-cand-<tag>-<NN>.png` 里的 `NN`），
+    所以行内三张天然是时间顺序。
 
     Returns:
         写出的 PNG 路径；一张都凑不出来时返回 None。
+
+    Raises:
+        RuntimeError: `XBOTICS_FIG_FONT` 取不到 —— 回落系统字体会静默换掉字形。
     """
     root = Path(__file__).resolve().parents[1] / "result"
-    tiles: list[tuple[str, np.ndarray]] = []
+    font_path = os.environ.get("XBOTICS_FIG_FONT", "")
+    if not font_path or not Path(font_path).is_file():
+        raise RuntimeError(f"出图字体取不到（西文 Times New Roman + 中文宋体）：{font_path!r}")
+
+    rows: list[tuple[str, list[Path]]] = []
     for slug, label in COVER_LAYOUT:
-        pick = _latest_parallel(root / slug)
-        if pick is None:
-            print(f"拼图缺一格：{label}（{slug} 还没渲出并行图）")
+        d = root / slug
+        cand = sorted(d.glob("cover-cand-*.png"), key=lambda q: q.stem.split("-")[-1]) if d.is_dir() else []
+        if not cand:
+            pick = _latest_parallel(d)
+            cand = [pick] if pick else []
+        if not cand:
+            print(f"动作带缺一行：{label}（{slug} 下没有候选定格）")
             continue
-        print(f"拼图取 {label}（{slug}）: {pick.name}")
-        tiles.append((label, plt.imread(pick)))
-    if not tiles:
-        print("一格都凑不出来，先渲各动作的并行图。")
+        rows.append((label, cand[:COVER_COLUMNS]))
+        print(f"动作带取 {label}（{slug}）: {' '.join(q.name for q in cand[:COVER_COLUMNS])}")
+    if not rows:
+        print("一行都凑不出来，先渲各动作的单只定格。")
         return None
 
-    use_project_font()
-    rows = -(-len(tiles) // COVER_COLUMNS)
-    # 每格 5.4×3.2 英寸，对应并行图的 16:9。
-    fig, axes = plt.subplots(rows, COVER_COLUMNS, figsize=(5.4 * COVER_COLUMNS, 3.2 * rows), dpi=200)
-    flat = np.atleast_1d(axes).ravel()
-    for ax, (label, img) in zip(flat, tiles, strict=False):
-        ax.imshow(img)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_title(label, fontsize=12)
-    for ax in flat[len(tiles):]:
-        ax.axis("off")
-    fig.suptitle("这里没有一个动作是人教的", fontsize=17)
-    fig.tight_layout()
+    tw, th = _COVER_TILE_PX
+    gut = _COVER_GUTTER_PX
+    width = _COVER_LABEL_PX + tw * COVER_COLUMNS
+    height = (th + gut) * len(rows) - gut
+    sheet = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(sheet)
+    font = ImageFont.truetype(font_path, 40)
+    for r, (label, paths) in enumerate(rows):
+        y = r * (th + gut)
+        box = draw.textbbox((0, 0), label, font=font)
+        draw.text((_COVER_LABEL_PX - (box[2] - box[0]) - 28, y + (th - (box[3] - box[1])) // 2 - box[1]),
+                  label, font=font, fill="black")
+        for c, q in enumerate(paths):
+            sheet.paste(Image.open(q).convert("RGB").resize((tw, th), Image.LANCZOS),
+                        (_COVER_LABEL_PX + c * tw, y))
     out = root / "cover.png"
-    fig.savefig(out)
-    plt.close(fig)
-    print(f"写出 {out}  ({len(tiles)} 格)")
+    sheet.save(out)
+    print(f"写出 {out}  ({len(rows)} 行 × {COVER_COLUMNS} 张)")
     return out
-
 
 def main():
     """当前 `TASK` 的并行仿真图 + 关键帧序列，然后重拼一次开篇图。"""

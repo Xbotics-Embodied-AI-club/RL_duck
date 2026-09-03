@@ -5,6 +5,9 @@ wandb/
 # 权重落 NAS（RL_DUCK_CKPT_ROOT），不进 git；万一有人在仓里生成也拦住。
 *.pt
 *.onnx
-# result/ 里的曲线、关键帧、json 是要提交的证据；只挡体积大的原始视频。
-result/**/*.mp4
+# 过程产物 result/ 已经移到仓外（`RL_DUCK_RESULT_ROOT`），这条留着挡住有人在仓里生成。
+result/
+# 交付视频二十多兆，按大文件规矩不进 git —— 文件就放在 交付/视频/，
+# 清单与重出办法写在 交付/README.md 里。图与 PDF 体积小，照常提交。
+交付/视频/*.mp4
 .uv-cache/

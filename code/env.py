@@ -13,6 +13,7 @@ actor 和 critic 各自那一份。三个训练版本共用本文件，对照时
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 # 导入即注册：这一行执行 mjlab_microduck 里所有 register_mjlab_task(...) 调用，
@@ -122,6 +123,22 @@ def split_actor_critic_obs(obs):
     return actor_obs, obs["critic"]
 
 
+def result_base() -> Path:
+    """过程产物的根目录。
+
+    默认是仓内的 `result/`（独立克隆下来的人跑一下就有东西看）；
+    本仓库把它指到仓外，理由是 `rl_duck/` 这个目录本身就是交付物 ——
+    交付物里不该混着几百兆的中间件。用 `RL_DUCK_RESULT_ROOT` 覆盖。
+
+    Returns:
+        过程产物根目录的绝对路径（已建好）。
+    """
+    override = os.environ.get("RL_DUCK_RESULT_ROOT")
+    base = Path(override) if override else Path(__file__).resolve().parents[1] / "result"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
 class DuckEnv:
     """小鸭子的 mjlab 任务环境，三个算法版本共用。
 
@@ -152,6 +169,7 @@ class DuckEnv:
         env_spacing=None,
         shadows=None,
         camera_origin=None,
+        debug_vis=None,
     ):
         if task not in list_tasks():
             raise ValueError(f"未注册的任务 {task!r}；可选值见 `python code/env.py`")
@@ -206,6 +224,35 @@ class DuckEnv:
         if shadows is not None:
             cfg.viewer.enable_shadows = shadows
             cfg.viewer.enable_reflections = shadows
+        # 指令的调试箭头（`twist` 那一项默认 debug_vis=True，画一根蓝色速度箭头，
+        # 有时还有一根绿色的竖轴）。它是**调试用的可视化**，不是机器人的一部分 ——
+        # 出图时必须关掉，否则读者会以为那是场景里的东西。
+        if debug_vis is not None:
+            cmds = cfg.commands
+            items = cmds.items() if hasattr(cmds, "items") else vars(cmds).items()
+            for name, c in list(items):
+                if not name.startswith("_") and hasattr(c, "debug_vis"):
+                    c.debug_vis = debug_vis
+        # 给录视频用的固定指令。**这是必须有的**：指令是每个回合随机采的，
+        # 而轮滑那档的范围是 (-0.5, 0.6)、蹲姿滑行是 (-1.0, 1.0) —— 都跨过零。
+        # 采到接近零的那次，"站着不动"就是正确行为，于是录出来的八秒里鸭子一动不动，
+        # 而这既不是策略坏了也不是渲染坏了，看视频的人只会以为它没学会。
+        # 写法：RL_DUCK_FORCE_CMD="lin_vel_x=0.5,lin_vel_y=0,ang_vel_z=0,heading=0"
+        forced = os.environ.get("RL_DUCK_FORCE_CMD")
+        if forced:
+            want = dict(kv.split("=", 1) for kv in forced.split(",") if "=" in kv)
+            cmds = cfg.commands
+            items = cmds.items() if hasattr(cmds, "items") else vars(cmds).items()
+            for name, c in list(items):
+                r = getattr(c, "ranges", None) if not name.startswith("_") else None
+                if r is None:
+                    continue
+                for key, value in want.items():
+                    # 原值是 None 表示这一档不用这个字段（轮滑的 heading 就是 None），
+                    # 给它塞一个区间会改变任务语义 —— 只钉本来就在用的字段。
+                    if getattr(r, key, None) is not None:
+                        setattr(r, key, (float(value), float(value)))
+
         if camera_origin is not None:
             origin_types = {
                 "world": cfg.viewer.OriginType.WORLD,        # 自由相机，看向 lookat

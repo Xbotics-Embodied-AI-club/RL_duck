@@ -24,7 +24,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from env import MAX_ITERATIONS, DuckEnv, task_slug
+from env import MAX_ITERATIONS, DuckEnv, result_base, task_slug
 from model import ActorCritic
 
 
@@ -36,7 +36,7 @@ def result_root() -> Path:
     Returns:
         `result/<task-slug>/` 的绝对路径。
     """
-    return Path(__file__).resolve().parents[1] / "result" / task_slug()
+    return result_base() / task_slug()
 
 
 def load_policy(checkpoint, device):
@@ -178,10 +178,16 @@ def run_rollout(checkpoint, run_name, num_envs=16, num_steps=400, device="cuda:0
         render_mode="rgb_array",
         shadows=False,
         render_size=(1280, 960),
-        camera_distance=0.9,
+        camera_distance=float(os.environ.get("RL_DUCK_VIDEO_DISTANCE") or 0.9),
         camera_elevation=-15.0,
         # 跟拍：策略在按速度指令行走，固定机位下它几秒就出画，长镜头会变成一段空地板。
-        camera_origin="asset_root",
+        # 但跟拍也有代价：镜头锁死在鸭子身上、地板又是无特征的格子，**位移就看不出来了**。
+        # 轮滑那档实测 5 秒走 1.553 米，录出来却像原地踏步。
+        # 所以留一个固定机位开关：短镜头（4–5 秒）配固定机位，让它横穿画面。
+        camera_origin="world" if os.environ.get("RL_DUCK_VIDEO_FIXED") else "asset_root",
+        # 关掉速度指令那根调试箭头。它是给开发者看的，交付的视频里不该有 ——
+        # 而它默认是开的，于是先前录出来的每一段里都插着一根绿的或紫的箭头。
+        debug_vis=False,
     )
     rewards, action_abs_means, frames = [], [], []
     # mjlab 把两类完全不同的东西混在同一个 extras["log"] 字典里，**刷新时机不一样**：

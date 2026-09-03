@@ -220,7 +220,8 @@ def main():
         ax.plot(env_steps, smooth(rewards), color=color, linewidth=1.8, label=label)
     ax.set_xlabel("环境步数")
     ax.set_ylabel("每步平均奖励")
-    ax.set_title("同一个任务、同一份预算，三个算法的学习曲线")
+    # 图上不写标题：图题是正文那一行的事，烧进 PNG 之后排版换了就动不了，
+    # 而且与图题逐字重复。哪条线是哪个算法由图例说明。
     ax.legend(frameon=False)
     ax.grid(alpha=0.25, linewidth=0.5)
     fig.tight_layout()
@@ -229,13 +230,13 @@ def main():
     plt.close(fig)
     print(f"写出 {combined}")
 
-    for algo, (env_steps, rewards, label, color) in series.items():
+    for algo, (env_steps, rewards, _label, color) in series.items():
         fig, ax = plt.subplots(figsize=(5.4, 3.4), dpi=200)
         ax.plot(env_steps, rewards, color=color, alpha=0.22, linewidth=0.8)
         ax.plot(env_steps, smooth(rewards), color=color, linewidth=1.8)
         ax.set_xlabel("环境步数")
         ax.set_ylabel("每步平均奖励")
-        ax.set_title(label)
+        # 同上，不烧标题 —— 单档曲线是哪一档，正文的图题里写着。
         ax.grid(alpha=0.25, linewidth=0.5)
         fig.tight_layout()
         single = out_dir / f"reward-{algo}.png"
